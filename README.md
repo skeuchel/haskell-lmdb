@@ -24,7 +24,7 @@ Known weaknesses of LMDB:
 * The database only ever grows. No direct support for compacting.
 * Set a maximum database size (weakness or strength?) when opening.
 
-Many of these weaknesses could be mitigated through a high-level binding.
+Many of these weaknesses could be mitigated through a high-level binding, e.g. leveraging STM-like abstractions. But this package aims to present LMDB as it exists, with only a thin layer for extra safety.
 
 # Haskell Bindings
 

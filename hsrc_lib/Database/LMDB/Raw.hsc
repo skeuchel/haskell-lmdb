@@ -1,6 +1,6 @@
 {-# LANGUAGE ForeignFunctionInterface, EmptyDataDecls #-}
 
--- | This module is a thin adapter above the C file lmdb.h.
+-- | This module is a thin wrapper above lmdb.h.
 module Database.LMDB.Raw
     ( LMDB_Version, lmdb_version
     , MDB_env, MDB_txn, MDB_cursor, MDB_dbi
@@ -8,7 +8,8 @@ module Database.LMDB.Raw
     , MDB_stat, ms_psize, ms_depth, ms_branch_pages, ms_leaf_pages, ms_overflow_pages, ms_entries
     , MDB_envinfo, me_mapaddr, me_mapsize, me_last_pgno, me_last_txnid, me_maxreaders, me_numreaders
     , CmpFn, wrapCmpFn
-
+    , MDB_EnvFlag(..), MDB_DbFlag(..)
+    , MDB_WriteFlag(..), MDB_WriteFlags, compileWriteFlags
     ) where
 
 #include <lmdb.h>
@@ -16,6 +17,9 @@ module Database.LMDB.Raw
 import Foreign
 import Foreign.C
 import Control.Exception
+import qualified Data.Array.Unboxed as A
+import Data.Monoid
+import qualified Data.List as L
 
 #let alignment t = "%lu", (unsigned long)offsetof(struct {char x__; t (y__); }, y__)
 
@@ -73,8 +77,10 @@ data MDB_cursor
 -- | Handle for a database in the environment.
 newtype MDB_dbi = MDB_dbi CUInt
 
--- | A value stored in the database. Be cautious; updates to the
--- database will invalidate this value.
+-- | A value stored in the database. Be cautious; committing the
+-- transaction that obtained a value should also invalidate it;
+-- avoid capturing MDB_val in a lazy value. A 'safe' interface
+-- similar to STRef will be provided in another module.
 data MDB_val = MDB_val
     { mv_size :: {-# UNPACK #-} !CSize
     , mv_data :: {-# UNPACK #-} !(Ptr Word8)
@@ -98,11 +104,105 @@ data MDB_envinfo = MDB_envinfo
     , me_numreaders :: {-# UNPACK #-} !CUInt
     } deriving (Eq, Ord, Show)
 
--- | Raw comparison function on keys. 
+-- | User-defined comparison functions for keys. 
+-- (Corresponds to: ByteString -> ByteString -> Ord)
 type CmpFn = Ptr MDB_val -> Ptr MDB_val -> IO CInt
-
--- | Create a user-defined comparison function (raw)
 foreign import ccall "wrapper"  wrapCmpFn :: CmpFn -> IO (FunPtr CmpFn)
+
+-- | Environment flags from lmdb.h
+data MDB_EnvFlag
+    = MDB_FIXEDMAP
+    | MDB_NOSUBDIR
+    | MDB_NOSYNC
+    | MDB_RDONLY
+    | MDB_NOMETASYNC
+    | MDB_WRITEMAP
+    | MDB_MAPASYNC
+    | MDB_NOTLS
+    | MDB_NOLOCK
+    | MDB_NORDAHEAD
+    | MDB_NOMEMINIT
+    deriving (Eq, Ord, Bounded, A.Ix)
+
+envFlags :: [(MDB_EnvFlag, Int)]
+envFlags =
+    [(MDB_FIXEDMAP, #const MDB_FIXEDMAP)
+    ,(MDB_NOSUBDIR, #const MDB_NOSUBDIR)
+    ,(MDB_NOSYNC, #const MDB_NOSYNC)
+    ,(MDB_RDONLY, #const MDB_RDONLY)
+    ,(MDB_NOMETASYNC, #const MDB_NOMETASYNC)
+    ,(MDB_WRITEMAP, #const MDB_WRITEMAP)
+    ,(MDB_MAPASYNC, #const MDB_MAPASYNC)
+    ,(MDB_NOTLS, #const MDB_NOTLS)
+    ,(MDB_NOLOCK, #const MDB_NOLOCK)
+    ,(MDB_NORDAHEAD, #const MDB_NORDAHEAD)
+    ,(MDB_NOMEMINIT, #const MDB_NOMEMINIT)
+    ]
+
+envFlagsArray :: A.UArray MDB_EnvFlag Int
+envFlagsArray = A.accumArray (.|.) 0 (minBound, maxBound) envFlags
+
+data MDB_DbFlag
+    = MDB_REVERSEKEY
+    | MDB_DUPSORT
+    | MDB_INTEGERKEY
+    | MDB_DUPFIXED
+    | MDB_INTEGERDUP
+    | MDB_REVERSEDUP
+    | MDB_CREATE
+    deriving (Ord, Eq, A.Ix, Bounded)
+
+dbFlags :: [(MDB_DbFlag, Int)]
+dbFlags =
+    [(MDB_REVERSEKEY, #const MDB_REVERSEKEY)
+    ,(MDB_DUPSORT, #const MDB_DUPSORT)
+    ,(MDB_INTEGERKEY, #const MDB_INTEGERKEY)
+    ,(MDB_DUPFIXED, #const MDB_DUPFIXED)
+    ,(MDB_INTEGERDUP, #const MDB_INTEGERDUP)
+    ,(MDB_REVERSEDUP, #const MDB_REVERSEDUP)
+    ,(MDB_CREATE, #const MDB_CREATE)
+    ]
+
+dbFlagsArray :: A.UArray MDB_DbFlag Int
+dbFlagsArray = A.accumArray (.|.) 0 (minBound,maxBound) dbFlags
+
+data MDB_WriteFlag 
+    = MDB_NOOVERWRITE
+    | MDB_NODUPDATA
+    | MDB_CURRENT
+    | MDB_RESERVE
+    | MDB_APPEND
+    | MDB_APPENDDUP
+    | MDB_MULTIPLE
+    deriving (Ord, Eq, Bounded, A.Ix)
+
+writeFlags :: [(MDB_WriteFlag, Int)]
+writeFlags =
+    [(MDB_NOOVERWRITE, #const MDB_NOOVERWRITE)
+    ,(MDB_NODUPDATA, #const MDB_NODUPDATA)
+    ,(MDB_CURRENT, #const MDB_CURRENT)
+    ,(MDB_RESERVE, #const MDB_RESERVE)
+    ,(MDB_APPEND, #const MDB_APPEND)
+    ,(MDB_APPENDDUP, #const MDB_APPENDDUP)
+    ,(MDB_MULTIPLE, #const MDB_MULTIPLE)
+    ]
+
+writeFlagsArray :: A.UArray MDB_WriteFlag Int
+writeFlagsArray = A.accumArray (.|.) 0 (minBound,maxBound) writeFlags
+
+-- | compiled write flags, corresponding to a [WriteFlag] list. Used
+-- because writes are frequent enough that we want to avoid building
+-- from a list on a per-write basis.
+newtype MDB_WriteFlags = MDB_WriteFlags CInt
+
+-- | compile a list of write flags. 
+compileWriteFlags :: [MDB_WriteFlag] -> MDB_WriteFlags
+compileWriteFlags = MDB_WriteFlags . L.foldl' addWF 0 where
+    addWF n wf = n .|. fromIntegral (writeFlagsArray A.! wf)
+
+
+
+
 
 {-
 cmpBytesToCmpFn :: (ByteString -> ByteString -> Ord) -> CmpFn
