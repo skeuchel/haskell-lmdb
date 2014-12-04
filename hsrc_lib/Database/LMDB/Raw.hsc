@@ -7,6 +7,7 @@
 --
 -- Notes:
 -- * Relocation functions aren't supported.
+-- * File handle operations aren't supported.
 -- * Unix mode fixed at 660 (read-write for user+group).
 -- * 
 module Database.LMDB.Raw
@@ -21,20 +22,21 @@ module Database.LMDB.Raw
     , MDB_EnvFlag(..), MDB_DbFlag(..)
     , MDB_WriteFlag(..), MDB_WriteFlags, compileWriteFlags
     , MDB_cursor_op(..)
+
 {-
     -- | Environment Operations
     , mdb_env_create
     , mdb_env_open
     , mdb_env_copy
-    , mdb_env_copyfd
+    -- , mdb_env_copyfd
     , mdb_env_stat
     , mdb_env_info
-    , mdb_env_sync
+    , mdb_env_sync, mdb_env_flush
     , mdb_env_close
-    , mdb_env_set_flags
+    , mdb_env_set_flags, mdb_env_unset_flags
     , mdb_env_get_flags
     , mdb_env_get_path
-    , mdb_env_get_fd
+    -- , mdb_env_get_fd
     , mdb_env_set_mapsize
     , mdb_env_set_maxreaders
     , mdb_env_get_maxreaders
@@ -184,13 +186,17 @@ newtype MDB_env = MDB_env (Ptr MDB_env)
 newtype MDB_txn = MDB_txn (Ptr MDB_txn)
 
 -- | Identifier for a transaction.
-newtype MDB_txnid = MDB_txnid { _txnid :: CSize } deriving (Ord, Eq, Show)
+newtype MDB_txnid = MDB_txnid { _txnid :: MDB_txnid_t } deriving (Ord, Eq, Show)
 
 -- | Opaque structure for LMDB cursor.
 newtype MDB_cursor = MDB_cursor (Ptr MDB_cursor)
 
 -- | Handle for a database in the environment.
-newtype MDB_dbi = MDB_dbi { _dbi :: CUInt } 
+newtype MDB_dbi = MDB_dbi { _dbi :: MDB_dbi_t } 
+
+type MDB_mode_t = #type mdb_mode_t
+type MDB_dbi_t = #type MDB_dbi
+type MDB_txnid_t = CSize -- typedef not currently exposed
 
 -- | A value stored in the database. Be cautious; committing the
 -- transaction that obtained a value should also invalidate it;
@@ -430,11 +436,19 @@ _throwLMDBErrNum context errNum = do
 
 
 foreign import ccall "lmdb.h mdb_env_create" _mdb_env_create :: Ptr (Ptr MDB_env) -> IO CInt
-
-
-type MDB_mode_t = #type mdb_mode_t
-
-
+foreign import ccall "lmdb.h mdb_env_open" _mdb_env_open :: MDB_env -> CString -> CUInt -> MDB_mode_t -> IO CInt
+foreign import ccall "lmdb.h mdb_env_copy" _mdb_env_copy :: MDB_env -> CString -> IO CInt
+foreign import ccall "lmdb.h mdb_env_stat" _mdb_env_stat :: MDB_env -> Ptr MDB_stat -> IO CInt
+foreign import ccall "lmdb.h mdb_env_info" _mdb_env_info :: MDB_env -> Ptr MDB_envinfo -> IO CInt
+foreign import ccall "lmdb.h mdb_env_sync" _mdb_env_sync :: MDB_env -> CInt -> IO CInt
+foreign import ccall "lmdb.h mdb_env_close" _mdb_env_close :: MDB_env -> IO ()
+foreign import ccall "lmdb.h mdb_env_set_flags" _mdb_env_set_flags :: MDB_env -> CUInt -> CInt -> IO CInt
+foreign import ccall "lmdb.h mdb_env_get_flags" _mdb_env_get_flags :: MDB_env -> Ptr CUInt -> IO CInt
+foreign import ccall "lmdb.h mdb_env_set_mapsize" _mdb_env_set_mapsize :: MDB_env -> CSize -> IO CInt
+foreign import ccall "lmdb.h mdb_env_set_maxreaders" _mdb_env_set_maxreaders :: MDB_env -> CUInt -> IO CInt
+foreign import ccall "lmdb.h mdb_env_get_maxreaders" _mdb_env_get_maxreaders :: MDB_env -> Ptr CUInt -> IO CInt
+foreign import ccall "lmdb.h mdb_env_set_maxdbs" _mdb_env_set_maxdbs :: MDB_env -> (#type MDB_dbi) -> IO CInt
+foreign import ccall "lmdb.h mdb_env_get_maxkeysize" _mdb_env_get_maxkeysize :: MDB_env -> IO CInt
 
 
 
