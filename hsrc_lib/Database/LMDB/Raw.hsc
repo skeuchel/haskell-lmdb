@@ -1,25 +1,100 @@
-{-# LANGUAGE ForeignFunctionInterface, EmptyDataDecls #-}
+{-# LANGUAGE ForeignFunctionInterface, DeriveDataTypeable #-}
 
 -- | This module is a thin wrapper above lmdb.h.
+--
+-- This wraps most of the opaque integral types and enumerations.
+-- Error return codes are transformed into Haskell exceptions.
+--
+-- Notes:
+-- * Relocation functions aren't supported.
+-- * Unix mode fixed at 660 (read-write for user+group).
+-- * 
 module Database.LMDB.Raw
-    ( LMDB_Version, lmdb_version
-    , MDB_env, MDB_txn, MDB_cursor, MDB_dbi
+    ( LMDB_Version(..), lmdb_version, lmdb_dyn_version
+    , LMDB_Error(..), MDB_ErrCode(..)
+
+    , MDB_env, MDB_txn, MDB_txnid, MDB_cursor, MDB_dbi
     , MDB_val, mv_size, mv_data
     , MDB_stat, ms_psize, ms_depth, ms_branch_pages, ms_leaf_pages, ms_overflow_pages, ms_entries
     , MDB_envinfo, me_mapaddr, me_mapsize, me_last_pgno, me_last_txnid, me_maxreaders, me_numreaders
     , CmpFn, wrapCmpFn
     , MDB_EnvFlag(..), MDB_DbFlag(..)
     , MDB_WriteFlag(..), MDB_WriteFlags, compileWriteFlags
+    , MDB_cursor_op(..)
+{-
+    -- | Environment Operations
+    , mdb_env_create
+    , mdb_env_open
+    , mdb_env_copy
+    , mdb_env_copyfd
+    , mdb_env_stat
+    , mdb_env_info
+    , mdb_env_sync
+    , mdb_env_close
+    , mdb_env_set_flags
+    , mdb_env_get_flags
+    , mdb_env_get_path
+    , mdb_env_get_fd
+    , mdb_env_set_mapsize
+    , mdb_env_set_maxreaders
+    , mdb_env_get_maxreaders
+    , mdb_env_set_maxdbs
+    , mdb_env_get_maxkeysize
+
+    -- | Transactions
+    , mdb_txn_begin
+    , mdb_txn_env
+    , mdb_txn_commit
+    , mdb_txn_abort
+    , mdb_txn_reset
+    , mdb_txn_renew
+
+    -- | Databases
+    , mdb_dbi_open
+    , mdb_stat
+    , mdb_dbi_flags
+    , mdb_dbi_close
+    , mdb_drop, mdb_clear
+    , mdb_set_compare
+    , mdb_set_dupsort
+    -- , mdb_set_relfunc
+    -- , mdb_set_relctx
+    
+    -- | Access
+    , mdb_get
+    , mdb_put
+    , mdb_del
+
+    -- | Cursors
+    , mdb_cursor_open
+    , mdb_cursor_close
+    , mdb_cursor_renew
+    , mdb_cursor_txn
+    , mdb_cursor_dbi
+    , mdb_cursor_get
+    , mdb_cursor_put
+    , mdb_cursor_del
+    , mdb_cursor_count
+
+    -- | Misc
+    , mdb_cmp
+    , mdb_dcmp
+    , mdb_reader_list
+    , mdb_reader_check
+-}
     ) where
 
 #include <lmdb.h>
 
 import Foreign
 import Foreign.C
+import Control.Applicative
+import Control.Monad
 import Control.Exception
 import qualified Data.Array.Unboxed as A
 import Data.Monoid
 import qualified Data.List as L
+import Data.Typeable
 
 #let alignment t = "%lu", (unsigned long)offsetof(struct {char x__; t (y__); }, y__)
 
@@ -50,10 +125,10 @@ import Data.Typeable
 -- the dynamic version of LMDB is different in the major or minor 
 -- fields.
 data LMDB_Version = LMDB_Version
-    { v_major :: Int
-    , v_minor :: Int
-    , v_patch :: Int
-    , v_date  :: String
+    { v_major :: {-# UNPACK #-} !Int
+    , v_minor :: {-# UNPACK #-} !Int
+    , v_patch :: {-# UNPACK #-} !Int
+    , v_text  :: !String
     } deriving (Eq, Ord, Show)
 
 -- | Version of LMDB when the Haskell-LMDB binding was compiled.
@@ -62,20 +137,60 @@ lmdb_version = LMDB_Version
     { v_major = #const MDB_VERSION_MAJOR
     , v_minor = #const MDB_VERSION_MINOR
     , v_patch = #const MDB_VERSION_PATCH
-    , v_date  = #const_str MDB_VERSION_DATE
+    , v_text  = #const_str MDB_VERSION_STRING
     }
 
+foreign import ccall "lmdb.h mdb_version" 
+    _mdb_version :: Ptr CInt -> Ptr CInt -> Ptr CInt -> IO CString
+
+-- Haskell seems to have difficulty inferring the `Ptr CInt` from 
+-- the _mdb_version call. (This seriously annoys me.)
+peekCInt :: Ptr CInt -> IO CInt
+peekCInt = peek
+
+-- | Version of LMDB linked to the current Haskell process.
+lmdb_dyn_version :: IO LMDB_Version
+lmdb_dyn_version =
+    let szInt = sizeOf (undefined :: CInt) in
+    allocaBytes (3 * szInt) $ \ pMajor -> do
+        let pMinor = pMajor `plusPtr` szInt
+        let pPatch = pMinor `plusPtr` szInt
+        cvText <- _mdb_version pMajor pMinor pPatch 
+        vMajor <- fromIntegral <$> peekCInt pMajor
+        vMinor <- fromIntegral <$> peekCInt pMinor
+        vPatch <- fromIntegral <$> peekCInt pPatch
+        vText  <- peekCString cvText
+        return $! LMDB_Version
+            { v_major = vMajor
+            , v_minor = vMinor
+            , v_patch = vPatch
+            , v_text  = vText
+            }
+
+-- | LMDB_Error is the exception type thrown in case a function from
+-- the LMDB API does not return successfully. Clients should be 
+-- prepared to catch exceptions from any LMDB operation.
+data LMDB_Error = LMDB_Error 
+    { e_context     :: String 
+    , e_description :: String 
+    , e_code        :: Either Int MDB_ErrCode
+    } deriving (Eq, Ord, Show, Typeable)
+instance Exception LMDB_Error
+
 -- | Opaque structure for LMDB environment.
-data MDB_env
+newtype MDB_env = MDB_env (Ptr MDB_env)
 
 -- | Opaque structure for LMDB transaction.
-data MDB_txn
+newtype MDB_txn = MDB_txn (Ptr MDB_txn)
+
+-- | Identifier for a transaction.
+newtype MDB_txnid = MDB_txnid { _txnid :: CSize } deriving (Ord, Eq, Show)
 
 -- | Opaque structure for LMDB cursor.
-data MDB_cursor
+newtype MDB_cursor = MDB_cursor (Ptr MDB_cursor)
 
 -- | Handle for a database in the environment.
-newtype MDB_dbi = MDB_dbi CUInt
+newtype MDB_dbi = MDB_dbi { _dbi :: CUInt } 
 
 -- | A value stored in the database. Be cautious; committing the
 -- transaction that obtained a value should also invalidate it;
@@ -99,7 +214,7 @@ data MDB_envinfo = MDB_envinfo
     { me_mapaddr :: {-# UNPACK #-} !(Ptr ())
     , me_mapsize :: {-# UNPACK #-} !CSize
     , me_last_pgno :: {-# UNPACK #-} !CSize
-    , me_last_txnid :: {-# UNPACK #-} !CSize
+    , me_last_txnid :: {-# UNPACK #-} !MDB_txnid
     , me_maxreaders :: {-# UNPACK #-} !CUInt
     , me_numreaders :: {-# UNPACK #-} !CUInt
     } deriving (Eq, Ord, Show)
@@ -122,7 +237,7 @@ data MDB_EnvFlag
     | MDB_NOLOCK
     | MDB_NORDAHEAD
     | MDB_NOMEMINIT
-    deriving (Eq, Ord, Bounded, A.Ix)
+    deriving (Eq, Ord, Bounded, A.Ix, Show)
 
 envFlags :: [(MDB_EnvFlag, Int)]
 envFlags =
@@ -150,7 +265,7 @@ data MDB_DbFlag
     | MDB_INTEGERDUP
     | MDB_REVERSEDUP
     | MDB_CREATE
-    deriving (Ord, Eq, A.Ix, Bounded)
+    deriving (Eq, Ord, Bounded, A.Ix, Show)
 
 dbFlags :: [(MDB_DbFlag, Int)]
 dbFlags =
@@ -174,7 +289,7 @@ data MDB_WriteFlag
     | MDB_APPEND
     | MDB_APPENDDUP
     | MDB_MULTIPLE
-    deriving (Ord, Eq, Bounded, A.Ix)
+    deriving (Eq, Ord, Bounded, A.Ix, Show)
 
 writeFlags :: [(MDB_WriteFlag, Int)]
 writeFlags =
@@ -200,8 +315,134 @@ compileWriteFlags :: [MDB_WriteFlag] -> MDB_WriteFlags
 compileWriteFlags = MDB_WriteFlags . L.foldl' addWF 0 where
     addWF n wf = n .|. fromIntegral (writeFlagsArray A.! wf)
 
+data MDB_cursor_op
+    = MDB_FIRST
+    | MDB_FIRST_DUP
+    | MDB_GET_BOTH
+    | MDB_GET_BOTH_RANGE
+    | MDB_GET_CURRENT
+    | MDB_GET_MULTIPLE
+    | MDB_LAST
+    | MDB_LAST_DUP
+    | MDB_NEXT
+    | MDB_NEXT_DUP
+    | MDB_NEXT_MULTIPLE
+    | MDB_NEXT_NODUP
+    | MDB_PREV
+    | MDB_PREV_DUP
+    | MDB_PREV_NODUP
+    | MDB_SET
+    | MDB_SET_KEY
+    | MDB_SET_RANGE
+    deriving (Eq, Ord, Bounded, A.Ix, Show)
+
+cursorOps :: [(MDB_cursor_op, Int)]
+cursorOps =
+    [(MDB_FIRST, #const MDB_FIRST)
+    ,(MDB_FIRST_DUP, #const MDB_FIRST_DUP)
+    ,(MDB_GET_BOTH, #const MDB_GET_BOTH)
+    ,(MDB_GET_BOTH_RANGE, #const MDB_GET_BOTH_RANGE)
+    ,(MDB_GET_CURRENT, #const MDB_GET_CURRENT)
+    ,(MDB_GET_MULTIPLE, #const MDB_GET_MULTIPLE)
+    ,(MDB_LAST, #const MDB_LAST)
+    ,(MDB_LAST_DUP, #const MDB_LAST_DUP)
+    ,(MDB_NEXT, #const MDB_NEXT)
+    ,(MDB_NEXT_DUP, #const MDB_NEXT_DUP)
+    ,(MDB_NEXT_MULTIPLE, #const MDB_NEXT_MULTIPLE)
+    ,(MDB_NEXT_NODUP, #const MDB_NEXT_NODUP)
+    ,(MDB_PREV, #const MDB_PREV)
+    ,(MDB_PREV_DUP, #const MDB_PREV_DUP)
+    ,(MDB_PREV_NODUP, #const MDB_PREV_NODUP)
+    ,(MDB_SET, #const MDB_SET)
+    ,(MDB_SET_KEY, #const MDB_SET_KEY)
+    ,(MDB_SET_RANGE, #const MDB_SET_RANGE)
+    ]
+
+cursorOpsArray :: A.UArray MDB_cursor_op Int 
+cursorOpsArray = A.accumArray (flip const) minBound (minBound,maxBound) cursorOps
+
+-- | Error codes from MDB. Note, however, that this API for MDB will mostly
+-- use exceptions for any non-successful return codes. This is mostly included
+-- because I feel the binding would be incomplete otherwise.
+--
+-- (The MDB_SUCCESS return value is excluded.)
+data MDB_ErrCode
+    = MDB_KEYEXIST
+    | MDB_NOTFOUND
+    | MDB_PAGE_NOTFOUND
+    | MDB_CORRUPTED
+    | MDB_PANIC
+    | MDB_VERSION_MISMATCH
+    | MDB_INVALID
+    | MDB_MAP_FULL
+    | MDB_DBS_FULL
+    | MDB_READERS_FULL
+    | MDB_TLS_FULL
+    | MDB_TXN_FULL
+    | MDB_CURSOR_FULL
+    | MDB_PAGE_FULL
+    | MDB_MAP_RESIZED
+    | MDB_INCOMPATIBLE
+    | MDB_BAD_RSLOT
+    | MDB_BAD_TXN
+    | MDB_BAD_VALSIZE
+    deriving (Eq, Ord, Bounded, A.Ix, Show)
+
+errCodes :: [(MDB_ErrCode, Int)]
+errCodes =
+    [(MDB_KEYEXIST, #const MDB_KEYEXIST)
+    ,(MDB_NOTFOUND, #const MDB_NOTFOUND)
+    ,(MDB_PAGE_NOTFOUND, #const MDB_PAGE_NOTFOUND)
+    ,(MDB_CORRUPTED, #const MDB_CORRUPTED)
+    ,(MDB_PANIC, #const MDB_PANIC)
+    ,(MDB_VERSION_MISMATCH, #const MDB_VERSION_MISMATCH)
+    ,(MDB_INVALID, #const MDB_INVALID)
+    ,(MDB_MAP_FULL, #const MDB_MAP_FULL)
+    ,(MDB_DBS_FULL, #const MDB_DBS_FULL)
+    ,(MDB_READERS_FULL, #const MDB_READERS_FULL)
+    ,(MDB_TLS_FULL, #const MDB_TLS_FULL)
+    ,(MDB_TXN_FULL, #const MDB_TXN_FULL)
+    ,(MDB_CURSOR_FULL, #const MDB_CURSOR_FULL)
+    ,(MDB_PAGE_FULL, #const MDB_PAGE_FULL)
+    ,(MDB_MAP_RESIZED, #const MDB_MAP_RESIZED)
+    ,(MDB_INCOMPATIBLE, #const MDB_INCOMPATIBLE)
+    ,(MDB_BAD_RSLOT, #const MDB_BAD_RSLOT)
+    ,(MDB_BAD_TXN, #const MDB_BAD_TXN)
+    ,(MDB_BAD_VALSIZE, #const MDB_BAD_VALSIZE)
+    ]
+
+_numToErrVal :: Int -> Either Int MDB_ErrCode
+_numToErrVal code = 
+    case L.find ((== code) . snd) errCodes of
+        Nothing -> Left code
+        Just (ec,_) -> Right ec
+
+foreign import ccall "lmdb.h mdb_strerror" _mdb_strerror :: CInt -> IO CString 
+
+_throwLMDBErrNum :: String -> CInt -> IO noReturn
+_throwLMDBErrNum context errNum = do
+    description <- peekCString =<< _mdb_strerror errNum
+    throwIO $! LMDB_Error
+        { e_context = context
+        , e_description = description
+        , e_code = _numToErrVal (fromIntegral errNum)
+        }
 
 
+foreign import ccall "lmdb.h mdb_env_create" _mdb_env_create :: Ptr (Ptr MDB_env) -> IO CInt
+
+
+type MDB_mode_t = #type mdb_mode_t
+
+
+
+
+
+
+
+
+
+    
 
 
 {-
@@ -301,7 +542,7 @@ instance Storable MDB_envinfo where
             { me_mapaddr = mapaddr
             , me_mapsize = mapsize
             , me_last_pgno = last_pgno
-            , me_last_txnid = last_txnid
+            , me_last_txnid = MDB_txnid last_txnid
             , me_maxreaders = maxreaders
             , me_numreaders = numreaders
             }
@@ -309,93 +550,8 @@ instance Storable MDB_envinfo where
         #{poke MDB_envinfo, me_mapaddr} ptr (me_mapaddr val)
         #{poke MDB_envinfo, me_mapsize} ptr (me_mapsize val)
         #{poke MDB_envinfo, me_last_pgno} ptr (me_last_pgno val)
-        #{poke MDB_envinfo, me_last_txnid} ptr (me_last_txnid val)
+        #{poke MDB_envinfo, me_last_txnid} ptr (_txnid $ me_last_txnid val)
         #{poke MDB_envinfo, me_maxreaders} ptr (me_maxreaders val)
         #{poke MDB_envinfo, me_numreaders} ptr (me_numreaders val)
-
-
-
-{-
-#define MDB_FIXEDMAP	0x01
-	/** no environment directory */
-#define MDB_NOSUBDIR	0x4000
-	/** don't fsync after commit */
-#define MDB_NOSYNC		0x10000
-	/** read only */
-#define MDB_RDONLY		0x20000
-	/** don't fsync metapage after commit */
-#define MDB_NOMETASYNC		0x40000
-	/** use writable mmap */
-#define MDB_WRITEMAP		0x80000
-	/** use asynchronous msync when #MDB_WRITEMAP is used */
-#define MDB_MAPASYNC		0x100000
-	/** tie reader locktable slots to #MDB_txn objects instead of to threads */
-#define MDB_NOTLS		0x200000
-	/** don't do any locking, caller must manage their own locks */
-#define MDB_NOLOCK		0x400000
-	/** don't do readahead (no effect on Windows) */
-#define MDB_NORDAHEAD	0x800000
-	/** don't initialize malloc'd memory before writing to datafile */
-#define MDB_NOMEMINIT	0x1000000
--}
-
-
-{-
-/** @defgroup  errors	Return Codes
- *
- *	BerkeleyDB uses -30800 to -30999, we'll go under them
- *	@{
- */
-	/**	Successful result */
-#define MDB_SUCCESS	 0
-	/** key/data pair already exists */
-#define MDB_KEYEXIST	(-30799)
-	/** key/data pair not found (EOF) */
-#define MDB_NOTFOUND	(-30798)
-	/** Requested page not found - this usually indicates corruption */
-#define MDB_PAGE_NOTFOUND	(-30797)
-	/** Located page was wrong type */
-#define MDB_CORRUPTED	(-30796)
-	/** Update of meta page failed, probably I/O error */
-#define MDB_PANIC		(-30795)
-	/** Environment version mismatch */
-#define MDB_VERSION_MISMATCH	(-30794)
-	/** File is not a valid MDB file */
-#define MDB_INVALID	(-30793)
-	/** Environment mapsize reached */
-#define MDB_MAP_FULL	(-30792)
-	/** Environment maxdbs reached */
-#define MDB_DBS_FULL	(-30791)
-	/** Environment maxreaders reached */
-#define MDB_READERS_FULL	(-30790)
-	/** Too many TLS keys in use - Windows only */
-#define MDB_TLS_FULL	(-30789)
-	/** Txn has too many dirty pages */
-#define MDB_TXN_FULL	(-30788)
-	/** Cursor stack too deep - internal error */
-#define MDB_CURSOR_FULL	(-30787)
-	/** Page has not enough space - internal error */
-#define MDB_PAGE_FULL	(-30786)
-	/** Database contents grew beyond environment mapsize */
-#define MDB_MAP_RESIZED	(-30785)
-	/** MDB_INCOMPATIBLE: Operation and DB incompatible, or DB flags changed */
-#define MDB_INCOMPATIBLE	(-30784)
-	/** Invalid reuse of reader locktable slot */
-#define MDB_BAD_RSLOT		(-30783)
-	/** Transaction cannot recover - it must be aborted */
-#define MDB_BAD_TXN			(-30782)
-	/** Too big key/data, key is empty, or wrong DUPFIXED size */
-#define MDB_BAD_VALSIZE		(-30781)
-#define MDB_LAST_ERRCODE	MDB_BAD_VALSIZE
--}
-
--- | Access the current (Major,Minor,Patch) version of LMDB for the
--- bound library. If this is different from lmdb_version, it might
--- be useful to rebuild the lmdb package.
-lmdb_dyn_version :: IO LMDB_Version
-lmdb_dyn_version = error "TODO"
-
-
-
 
 
