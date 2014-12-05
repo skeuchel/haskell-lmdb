@@ -6,10 +6,10 @@
 -- Error return codes are transformed into Haskell exceptions.
 --
 -- Notes:
--- * Relocation functions aren't supported.
--- * File handle operations aren't supported.
+-- * Relocation functions are not supported.
+-- * File handle operations are not supported.
 -- * Unix mode fixed at 660 (read-write for user+group).
--- * 
+--
 module Database.LMDB.Raw
     ( LMDB_Version(..), lmdb_version, lmdb_dyn_version
     , LMDB_Error(..), MDB_ErrCode(..)
@@ -23,20 +23,19 @@ module Database.LMDB.Raw
     , MDB_WriteFlag(..), MDB_WriteFlags, compileWriteFlags
     , MDB_cursor_op(..)
 
-{-
     -- | Environment Operations
     , mdb_env_create
     , mdb_env_open
     , mdb_env_copy
-    -- , mdb_env_copyfd
     , mdb_env_stat
     , mdb_env_info
+
+{-
     , mdb_env_sync, mdb_env_flush
     , mdb_env_close
     , mdb_env_set_flags, mdb_env_unset_flags
     , mdb_env_get_flags
     , mdb_env_get_path
-    -- , mdb_env_get_fd
     , mdb_env_set_mapsize
     , mdb_env_set_maxreaders
     , mdb_env_get_maxreaders
@@ -46,6 +45,7 @@ module Database.LMDB.Raw
     -- | Transactions
     , mdb_txn_begin
     , mdb_txn_env
+    -- , mdb_txn_id
     , mdb_txn_commit
     , mdb_txn_abort
     , mdb_txn_reset
@@ -65,7 +65,7 @@ module Database.LMDB.Raw
     -- | Access
     , mdb_get
     , mdb_put
-    , mdb_del
+    , mdb_del, mdb_delKey
 
     -- | Cursors
     , mdb_cursor_open
@@ -97,26 +97,77 @@ import qualified Data.Array.Unboxed as A
 import Data.Monoid
 import qualified Data.List as L
 import Data.Typeable
+import System.IO (FilePath)
+import Data.Function (on)
 
 #let alignment t = "%lu", (unsigned long)offsetof(struct {char x__; t (y__); }, y__)
 
-{-
-import Foreign.Marshal.Alloc
-import Foreign.Storable
-import Foreign.Ptr
-import Control.Applicative
-import Control.Monad
-import Data.Bits
-import Data.Maybe
-import System.IO.Error
-import System.IO (FilePath)
-import Foreign.ForeignPtr
-import Data.ByteString (ByteString)
-import qualified Data.ByteString.Internal as BSI
-import Data.Word
-import Control.Exception.Extensible
-import Data.Typeable
--}
+foreign import ccall "lmdb.h mdb_version" _mdb_version :: Ptr CInt -> Ptr CInt -> Ptr CInt -> IO CString
+foreign import ccall "lmdb.h mdb_strerror" _mdb_strerror :: CInt -> CString 
+
+foreign import ccall "lmdb.h mdb_env_create" _mdb_env_create :: Ptr (Ptr MDB_env) -> IO CInt
+foreign import ccall "lmdb.h mdb_env_open" _mdb_env_open :: MDB_env -> CString -> CUInt -> MDB_mode_t -> IO CInt
+foreign import ccall "lmdb.h mdb_env_copy" _mdb_env_copy :: MDB_env -> CString -> IO CInt
+foreign import ccall "lmdb.h mdb_env_stat" _mdb_env_stat :: MDB_env -> Ptr MDB_stat -> IO CInt
+foreign import ccall "lmdb.h mdb_env_info" _mdb_env_info :: MDB_env -> Ptr MDB_envinfo -> IO CInt
+foreign import ccall "lmdb.h mdb_env_sync" _mdb_env_sync :: MDB_env -> CInt -> IO CInt
+foreign import ccall "lmdb.h mdb_env_close" _mdb_env_close :: MDB_env -> IO ()
+foreign import ccall "lmdb.h mdb_env_set_flags" _mdb_env_set_flags :: MDB_env -> CUInt -> CInt -> IO CInt
+foreign import ccall "lmdb.h mdb_env_get_flags" _mdb_env_get_flags :: MDB_env -> Ptr CUInt -> IO CInt
+foreign import ccall "lmdb.h mdb_env_set_mapsize" _mdb_env_set_mapsize :: MDB_env -> CSize -> IO CInt
+foreign import ccall "lmdb.h mdb_env_set_maxreaders" _mdb_env_set_maxreaders :: MDB_env -> CUInt -> IO CInt
+foreign import ccall "lmdb.h mdb_env_get_maxreaders" _mdb_env_get_maxreaders :: MDB_env -> Ptr CUInt -> IO CInt
+foreign import ccall "lmdb.h mdb_env_set_maxdbs" _mdb_env_set_maxdbs :: MDB_env -> MDB_dbi_t -> IO CInt
+foreign import ccall "lmdb.h mdb_env_get_maxkeysize" _mdb_env_get_maxkeysize :: MDB_env -> IO CInt
+
+foreign import ccall "lmdb.h mdb_txn_begin" _mdb_txn_begin :: MDB_env -> MDB_txn -> CUInt -> Ptr (Ptr MDB_txn) -> IO CInt
+foreign import ccall "lmdb.h mdb_txn_env" _mdb_txn_env :: MDB_txn -> IO (Ptr MDB_env)
+-- I'm hoping to get a patch adding the following function into LMDB; it would allow layering useful features. 
+-- foreign import ccall "lmdb.h mdb_txn_id" _mdb_txn_id :: MDB_txn -> MDB_txnid_t 
+foreign import ccall "lmdb.h mdb_txn_commit" _mdb_txn_commit :: MDB_txn -> IO CInt
+foreign import ccall "lmdb.h mdb_txn_abort" _mdb_txn_abort :: MDB_txn -> IO ()
+foreign import ccall "lmdb.h mdb_txn_reset" _mdb_txn_reset :: MDB_txn -> IO ()
+foreign import ccall "lmdb.h mdb_txn_renew" _mdb_txn_renew :: MDB_txn -> IO CInt
+
+foreign import ccall "lmdb.h mdb_dbi_open" _mdb_dbi_open :: MDB_txn -> CString -> CUInt -> Ptr MDB_dbi_t -> IO CInt
+foreign import ccall "lmdb.h mdb_stat" _mdb_stat :: MDB_txn -> MDB_dbi -> Ptr MDB_stat -> IO CInt
+foreign import ccall "lmdb.h mdb_dbi_flags" _mdb_dbi_flags :: MDB_txn -> MDB_dbi -> Ptr CUInt -> IO CInt
+foreign import ccall "lmdb.h mdb_dbi_close" _mdb_dbi_close :: MDB_env -> MDB_dbi -> IO ()
+foreign import ccall "lmdb.h mdb_drop" _mdb_drop :: MDB_txn -> MDB_dbi -> CInt -> IO CInt
+foreign import ccall "lmdb.h mdb_set_compare" _mdb_set_compare :: MDB_txn -> MDB_dbi -> MDB_cmp_func -> IO CInt
+foreign import ccall "lmdb.h mdb_set_dupsort" _mdb_set_dupsort :: MDB_txn -> MDB_dbi -> MDB_cmp_func -> IO CInt
+
+foreign import ccall "lmdb.h mdb_get" _mdb_get :: MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+foreign import ccall "lmdb.h mdb_put" _mdb_put :: MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
+foreign import ccall "lmdb.h mdb_del" _mdb_del :: MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+
+foreign import ccall "lmdb.h mdb_cursor_open" _mdb_cursor_open :: MDB_txn -> MDB_dbi -> Ptr (Ptr MDB_cursor) -> IO CInt
+foreign import ccall "lmdb.h mdb_cursor_close" _mdb_cursor_close :: MDB_cursor -> IO ()
+foreign import ccall "lmdb.h mdb_cursor_renew" _mdb_cursor_renew :: MDB_txn -> MDB_cursor -> IO CInt
+foreign import ccall "lmdb.h mdb_cursor_txn" _mdb_cursor_txn :: MDB_cursor -> IO (Ptr MDB_txn)
+foreign import ccall "lmdb.h mdb_cursor_dbi" _mdb_cursor_dbi :: MDB_cursor -> IO MDB_dbi
+foreign import ccall "lmdb.h mdb_cursor_get" _mdb_cursor_get :: MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> (#type MDB_cursor_op) -> IO CInt
+foreign import ccall "lmdb.h mdb_cursor_put" _mdb_cursor_put :: MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
+foreign import ccall "lmdb.h mdb_cursor_del" _mdb_cursor_del :: MDB_cursor -> MDB_WriteFlags -> IO CInt
+foreign import ccall "lmdb.h mdb_cursor_count" _mdb_cursor_count :: MDB_cursor -> Ptr CSize -> IO CInt
+
+foreign import ccall "lmdb.h mdb_cmp" _mdb_cmp :: MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+foreign import ccall "lmdb.h mdb_dcmp" _mdb_dcmp :: MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+
+type MsgFunc = CString -> Ptr () -> IO CInt
+type MDB_msg_func = FunPtr MsgFunc
+foreign import ccall "wrapper" wrapMsgFunc :: MsgFunc -> IO MDB_msg_func
+foreign import ccall "lmdb.h mdb_reader_list" _mdb_reader_list :: MDB_env -> MDB_msg_func -> Ptr () -> IO CInt
+foreign import ccall "lmdb.h mdb_reader_check" _mdb_reader_check :: MDB_env -> Ptr CInt -> IO CInt
+
+
+-- Haskell seems to have difficulty inferring the `Ptr CInt` from 
+-- the _mdb_version call. (This seriously annoys me.)
+peekCInt :: Ptr CInt -> IO CInt
+peekCInt = peek
+
+peekCUInt :: Ptr CUInt -> IO CUInt
+peekCUInt = peek
 
 -- | Version information for LMDB. Two potentially different versions
 -- can be obtained: lmdb_version returns the version at the time of 
@@ -142,13 +193,6 @@ lmdb_version = LMDB_Version
     , v_text  = #const_str MDB_VERSION_STRING
     }
 
-foreign import ccall "lmdb.h mdb_version" 
-    _mdb_version :: Ptr CInt -> Ptr CInt -> Ptr CInt -> IO CString
-
--- Haskell seems to have difficulty inferring the `Ptr CInt` from 
--- the _mdb_version call. (This seriously annoys me.)
-peekCInt :: Ptr CInt -> IO CInt
-peekCInt = peek
 
 -- | Version of LMDB linked to the current Haskell process.
 lmdb_dyn_version :: IO LMDB_Version
@@ -228,7 +272,8 @@ data MDB_envinfo = MDB_envinfo
 -- | User-defined comparison functions for keys. 
 -- (Corresponds to: ByteString -> ByteString -> Ord)
 type CmpFn = Ptr MDB_val -> Ptr MDB_val -> IO CInt
-foreign import ccall "wrapper"  wrapCmpFn :: CmpFn -> IO (FunPtr CmpFn)
+type MDB_cmp_func = FunPtr CmpFn
+foreign import ccall "wrapper"  wrapCmpFn :: CmpFn -> IO MDB_cmp_func
 
 -- | Environment flags from lmdb.h
 data MDB_EnvFlag
@@ -263,6 +308,9 @@ envFlags =
 envFlagsArray :: A.UArray MDB_EnvFlag Int
 envFlagsArray = A.accumArray (.|.) 0 (minBound, maxBound) envFlags
 
+compileEnvFlags :: [MDB_EnvFlag] -> CUInt
+compileEnvFlags = fromIntegral . L.foldl' (.|.) 0 . fmap ((A.!) envFlagsArray)
+
 data MDB_DbFlag
     = MDB_REVERSEKEY
     | MDB_DUPSORT
@@ -286,6 +334,9 @@ dbFlags =
 
 dbFlagsArray :: A.UArray MDB_DbFlag Int
 dbFlagsArray = A.accumArray (.|.) 0 (minBound,maxBound) dbFlags
+
+compileDBFlags :: [MDB_DbFlag] -> CUInt
+compileDBFlags = fromIntegral . L.foldl' (.|.) 0 . fmap ((A.!) dbFlagsArray)
 
 data MDB_WriteFlag 
     = MDB_NOOVERWRITE
@@ -314,7 +365,7 @@ writeFlagsArray = A.accumArray (.|.) 0 (minBound,maxBound) writeFlags
 -- | compiled write flags, corresponding to a [WriteFlag] list. Used
 -- because writes are frequent enough that we want to avoid building
 -- from a list on a per-write basis.
-newtype MDB_WriteFlags = MDB_WriteFlags CInt
+newtype MDB_WriteFlags = MDB_WriteFlags CUInt
 
 -- | compile a list of write flags. 
 compileWriteFlags :: [MDB_WriteFlag] -> MDB_WriteFlags
@@ -366,6 +417,10 @@ cursorOps =
 
 cursorOpsArray :: A.UArray MDB_cursor_op Int 
 cursorOpsArray = A.accumArray (flip const) minBound (minBound,maxBound) cursorOps
+
+vCursorOp :: MDB_cursor_op -> (#type MDB_cursor_op)
+vCursorOp = fromIntegral . (A.!) cursorOpsArray
+
 
 -- | Error codes from MDB. Note, however, that this API for MDB will mostly
 -- use exceptions for any non-successful return codes. This is mostly included
@@ -423,23 +478,87 @@ _numToErrVal code =
         Nothing -> Left code
         Just (ec,_) -> Right ec
 
-foreign import ccall "lmdb.h mdb_strerror" _mdb_strerror :: CInt -> IO CString 
-
 _throwLMDBErrNum :: String -> CInt -> IO noReturn
 _throwLMDBErrNum context errNum = do
-    description <- peekCString =<< _mdb_strerror errNum
+    desc <- peekCString (_mdb_strerror errNum)
     throwIO $! LMDB_Error
         { e_context = context
-        , e_description = description
+        , e_description = desc
         , e_code = _numToErrVal (fromIntegral errNum)
         }
 
 
-foreign import ccall "lmdb.h mdb_env_create" _mdb_env_create :: Ptr (Ptr MDB_env) -> IO CInt
-foreign import ccall "lmdb.h mdb_env_open" _mdb_env_open :: MDB_env -> CString -> CUInt -> MDB_mode_t -> IO CInt
-foreign import ccall "lmdb.h mdb_env_copy" _mdb_env_copy :: MDB_env -> CString -> IO CInt
-foreign import ccall "lmdb.h mdb_env_stat" _mdb_env_stat :: MDB_env -> Ptr MDB_stat -> IO CInt
-foreign import ccall "lmdb.h mdb_env_info" _mdb_env_info :: MDB_env -> Ptr MDB_envinfo -> IO CInt
+-- | Allocate an environment object. This doesn't open the environment.
+-- 
+-- In addition to normal LMDB errors, this operation may throw an
+-- MDB_VERSION_MISMATCH if the Haskell LMDB bindings doesn't match
+-- the dynamic version. If this happens, you'll need to rebuild the
+-- lmdb Haskell package, and ensure your lmdb-dev libraries are up
+-- to date. 
+mdb_env_create :: IO MDB_env
+mdb_env_create = alloca $ \ ppEnv -> 
+    lmdb_validate_version_match >>
+    _mdb_env_create ppEnv >>= \ rc ->
+    if (0 == rc) then MDB_env <$> peek ppEnv else
+    _throwLMDBErrNum "mdb_env_create" rc
+
+lmdb_validate_version_match :: IO ()
+lmdb_validate_version_match = 
+    let vStat = lmdb_version in
+    lmdb_dyn_version >>= \ vDyn ->
+    unless (versionMatch vStat vDyn) $
+        throwIO $! LMDB_Error
+            { e_context = "matching Haskell binding with LMDB shared library"
+            , e_description = "Bindings for: " ++ show vStat ++ "\nLMDB library: " ++ show vDyn
+            , e_code = Right MDB_VERSION_MISMATCH
+            }
+
+versionMatch :: LMDB_Version -> LMDB_Version -> Bool
+versionMatch vA vB = matchMajor && matchMinor where
+    matchMajor = ((==) `on` v_major) vA vB
+    matchMinor = ((==) `on` v_minor) vA vB
+
+-- | open or build a database in the filesystem. The named directory
+-- must already exist and be writeable.
+mdb_env_open :: MDB_env -> FilePath -> [MDB_EnvFlag] -> IO ()
+mdb_env_open env fp flags = 
+    let iFlags = compileEnvFlags flags in
+    let unix_mode = (6 * 64 + 6 * 8) in -- mode 0660, read-write for user+group
+    withCString fp $ \ cfp ->
+        _mdb_env_open env cfp iFlags unix_mode >>= \ rc ->
+        unless (0 == rc) $
+            _throwLMDBErrNum "mdb_env_open" rc
+
+-- | copy the environment into an empty directory. Target directory
+-- must already exist and be empty.
+mdb_env_copy :: MDB_env -> FilePath -> IO ()
+mdb_env_copy env fp = 
+    withCString fp $ \ cfp ->
+        _mdb_env_copy env cfp >>= \ rc -> 
+        unless (0 == rc) $
+            _throwLMDBErrNum "mdb_env_copy" rc
+
+-- | obtain statistics for environment
+mdb_env_stat :: MDB_env -> IO MDB_stat
+mdb_env_stat env =
+    alloca $ \ pStats ->
+        _mdb_env_stat env pStats >>= \ rc ->
+        if (0 == rc) then peek pStats else
+        _throwLMDBErrNum "mdb_env_stat" rc
+
+-- | obtain ad-hoc information about the environment.
+mdb_env_info :: MDB_env -> IO MDB_envinfo
+mdb_env_info env =
+    alloca $ \ pInfo ->
+        _mdb_env_info env pInfo >>= \ rc ->
+        if (0 == rc) then peek pInfo else
+        _throwLMDBErrNum "mdb_env_info" rc
+
+
+
+
+
+{-
 foreign import ccall "lmdb.h mdb_env_sync" _mdb_env_sync :: MDB_env -> CInt -> IO CInt
 foreign import ccall "lmdb.h mdb_env_close" _mdb_env_close :: MDB_env -> IO ()
 foreign import ccall "lmdb.h mdb_env_set_flags" _mdb_env_set_flags :: MDB_env -> CUInt -> CInt -> IO CInt
@@ -447,16 +566,51 @@ foreign import ccall "lmdb.h mdb_env_get_flags" _mdb_env_get_flags :: MDB_env ->
 foreign import ccall "lmdb.h mdb_env_set_mapsize" _mdb_env_set_mapsize :: MDB_env -> CSize -> IO CInt
 foreign import ccall "lmdb.h mdb_env_set_maxreaders" _mdb_env_set_maxreaders :: MDB_env -> CUInt -> IO CInt
 foreign import ccall "lmdb.h mdb_env_get_maxreaders" _mdb_env_get_maxreaders :: MDB_env -> Ptr CUInt -> IO CInt
-foreign import ccall "lmdb.h mdb_env_set_maxdbs" _mdb_env_set_maxdbs :: MDB_env -> (#type MDB_dbi) -> IO CInt
+foreign import ccall "lmdb.h mdb_env_set_maxdbs" _mdb_env_set_maxdbs :: MDB_env -> MDB_dbi_t -> IO CInt
 foreign import ccall "lmdb.h mdb_env_get_maxkeysize" _mdb_env_get_maxkeysize :: MDB_env -> IO CInt
 
+foreign import ccall "lmdb.h mdb_txn_begin" _mdb_txn_begin :: MDB_env -> MDB_txn -> CUInt -> Ptr (Ptr MDB_txn) -> IO CInt
+foreign import ccall "lmdb.h mdb_txn_env" _mdb_txn_env :: MDB_txn -> IO (Ptr MDB_env)
+-- I'm hoping to get a patch adding the following function into LMDB; it would allow layering useful features. 
+-- foreign import ccall "lmdb.h mdb_txn_id" _mdb_txn_id :: MDB_txn -> MDB_txnid_t 
+foreign import ccall "lmdb.h mdb_txn_commit" _mdb_txn_commit :: MDB_txn -> IO CInt
+foreign import ccall "lmdb.h mdb_txn_abort" _mdb_txn_abort :: MDB_txn -> IO ()
+foreign import ccall "lmdb.h mdb_txn_reset" _mdb_txn_reset :: MDB_txn -> IO ()
+foreign import ccall "lmdb.h mdb_txn_renew" _mdb_txn_renew :: MDB_txn -> IO CInt
 
+foreign import ccall "lmdb.h mdb_dbi_open" _mdb_dbi_open :: MDB_txn -> CString -> CUInt -> Ptr MDB_dbi_t -> IO CInt
+foreign import ccall "lmdb.h mdb_stat" _mdb_stat :: MDB_txn -> MDB_dbi -> Ptr MDB_stat -> IO CInt
+foreign import ccall "lmdb.h mdb_dbi_flags" _mdb_dbi_flags :: MDB_txn -> MDB_dbi -> Ptr CUInt -> IO CInt
+foreign import ccall "lmdb.h mdb_dbi_close" _mdb_dbi_close :: MDB_env -> MDB_dbi -> IO ()
+foreign import ccall "lmdb.h mdb_drop" _mdb_drop :: MDB_txn -> MDB_dbi -> CInt -> IO CInt
+foreign import ccall "lmdb.h mdb_set_compare" _mdb_set_compare :: MDB_txn -> MDB_dbi -> MDB_cmp_func -> IO CInt
+foreign import ccall "lmdb.h mdb_set_dupsort" _mdb_set_dupsort :: MDB_txn -> MDB_dbi -> MDB_cmp_func -> IO CInt
 
+foreign import ccall "lmdb.h mdb_get" _mdb_get :: MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+foreign import ccall "lmdb.h mdb_put" _mdb_put :: MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
+foreign import ccall "lmdb.h mdb_del" _mdb_del :: MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
 
+foreign import ccall "lmdb.h mdb_cursor_open" _mdb_cursor_open :: MDB_txn -> MDB_dbi -> Ptr (Ptr MDB_cursor) -> IO CInt
+foreign import ccall "lmdb.h mdb_cursor_close" _mdb_cursor_close :: MDB_cursor -> IO ()
+foreign import ccall "lmdb.h mdb_cursor_renew" _mdb_cursor_renew :: MDB_txn -> MDB_cursor -> IO CInt
+foreign import ccall "lmdb.h mdb_cursor_txn" _mdb_cursor_txn :: MDB_cursor -> IO (Ptr MDB_txn)
+foreign import ccall "lmdb.h mdb_cursor_dbi" _mdb_cursor_dbi :: MDB_cursor -> IO MDB_dbi
+foreign import ccall "lmdb.h mdb_cursor_get" _mdb_cursor_get :: MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> (#type MDB_cursor_op) -> IO CInt
+foreign import ccall "lmdb.h mdb_cursor_put" _mdb_cursor_put :: MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
+foreign import ccall "lmdb.h mdb_cursor_del" _mdb_cursor_del :: MDB_cursor -> MDB_WriteFlags -> IO CInt
+foreign import ccall "lmdb.h mdb_cursor_count" _mdb_cursor_count :: MDB_cursor -> Ptr CSize -> IO CInt
 
+foreign import ccall "lmdb.h mdb_cmp" _mdb_cmp :: MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+foreign import ccall "lmdb.h mdb_dcmp" _mdb_dcmp :: MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
 
-
+type MsgFunc = CString -> Ptr () -> IO CInt
+type MDB_msg_func = FunPtr MsgFunc
+foreign import ccall "wrapper" wrapMsgFunc :: MsgFunc -> IO MDB_msg_func
+foreign import ccall "lmdb.h mdb_reader_list" _mdb_reader_list :: MDB_env -> MDB_msg_func -> Ptr () -> IO CInt
+foreign import ccall "lmdb.h mdb_reader_check" _mdb_reader_check :: MDB_env -> Ptr CInt -> IO CInt
     
+-}
+
 
 
 {-
