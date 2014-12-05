@@ -29,9 +29,7 @@ module Database.LMDB.Raw
     , mdb_env_copy
     , mdb_env_stat
     , mdb_env_info
-
-{-
-    , mdb_env_sync, mdb_env_flush
+    , mdb_env_sync, mdb_env_sync_flush
     , mdb_env_close
     , mdb_env_set_flags, mdb_env_unset_flags
     , mdb_env_get_flags
@@ -42,8 +40,10 @@ module Database.LMDB.Raw
     , mdb_env_set_maxdbs
     , mdb_env_get_maxkeysize
 
+{-
     -- | Transactions
     , mdb_txn_begin
+    , mdb_txn_begin_rdonly
     , mdb_txn_env
     -- , mdb_txn_id
     , mdb_txn_commit
@@ -93,8 +93,8 @@ import Foreign.C
 import Control.Applicative
 import Control.Monad
 import Control.Exception
+import Control.Concurrent (rtsSupportsBoundThreads, isCurrentThreadBound)
 import qualified Data.Array.Unboxed as A
-import Data.Monoid
 import qualified Data.List as L
 import Data.Typeable
 import System.IO (FilePath)
@@ -114,6 +114,7 @@ foreign import ccall "lmdb.h mdb_env_sync" _mdb_env_sync :: MDB_env -> CInt -> I
 foreign import ccall "lmdb.h mdb_env_close" _mdb_env_close :: MDB_env -> IO ()
 foreign import ccall "lmdb.h mdb_env_set_flags" _mdb_env_set_flags :: MDB_env -> CUInt -> CInt -> IO CInt
 foreign import ccall "lmdb.h mdb_env_get_flags" _mdb_env_get_flags :: MDB_env -> Ptr CUInt -> IO CInt
+foreign import ccall "lmdb.h mdb_env_get_path" _mdb_env_get_path :: MDB_env -> Ptr CString -> IO CInt
 foreign import ccall "lmdb.h mdb_env_set_mapsize" _mdb_env_set_mapsize :: MDB_env -> CSize -> IO CInt
 foreign import ccall "lmdb.h mdb_env_set_maxreaders" _mdb_env_set_maxreaders :: MDB_env -> CUInt -> IO CInt
 foreign import ccall "lmdb.h mdb_env_get_maxreaders" _mdb_env_get_maxreaders :: MDB_env -> Ptr CUInt -> IO CInt
@@ -163,11 +164,11 @@ foreign import ccall "lmdb.h mdb_reader_check" _mdb_reader_check :: MDB_env -> P
 
 -- Haskell seems to have difficulty inferring the `Ptr CInt` from 
 -- the _mdb_version call. (This seriously annoys me.)
-peekCInt :: Ptr CInt -> IO CInt
-peekCInt = peek
+_peekCInt :: Ptr CInt -> IO CInt
+_peekCInt = peek
 
-peekCUInt :: Ptr CUInt -> IO CUInt
-peekCUInt = peek
+_peekCUInt :: Ptr CUInt -> IO CUInt
+_peekCUInt = peek
 
 -- | Version information for LMDB. Two potentially different versions
 -- can be obtained: lmdb_version returns the version at the time of 
@@ -202,9 +203,9 @@ lmdb_dyn_version =
         let pMinor = pMajor `plusPtr` szInt
         let pPatch = pMinor `plusPtr` szInt
         cvText <- _mdb_version pMajor pMinor pPatch 
-        vMajor <- fromIntegral <$> peekCInt pMajor
-        vMinor <- fromIntegral <$> peekCInt pMinor
-        vPatch <- fromIntegral <$> peekCInt pPatch
+        vMajor <- fromIntegral <$> _peekCInt pMajor
+        vMinor <- fromIntegral <$> _peekCInt pMinor
+        vPatch <- fromIntegral <$> _peekCInt pPatch
         vText  <- peekCString cvText
         return $! LMDB_Version
             { v_major = vMajor
@@ -311,6 +312,14 @@ envFlagsArray = A.accumArray (.|.) 0 (minBound, maxBound) envFlags
 compileEnvFlags :: [MDB_EnvFlag] -> CUInt
 compileEnvFlags = fromIntegral . L.foldl' (.|.) 0 . fmap ((A.!) envFlagsArray)
 
+decompileBitFlags :: [(a,Int)] -> Int -> [a]
+decompileBitFlags optFlags n = fmap fst $ L.filter fullMatch optFlags where
+    fullMatch (_,f) = (f == (n .&. f))
+
+decompileEnvFlags :: CUInt -> [MDB_EnvFlag]
+decompileEnvFlags = decompileBitFlags envFlags . fromIntegral
+
+
 data MDB_DbFlag
     = MDB_REVERSEKEY
     | MDB_DUPSORT
@@ -337,6 +346,9 @@ dbFlagsArray = A.accumArray (.|.) 0 (minBound,maxBound) dbFlags
 
 compileDBFlags :: [MDB_DbFlag] -> CUInt
 compileDBFlags = fromIntegral . L.foldl' (.|.) 0 . fmap ((A.!) dbFlagsArray)
+
+decompileDBFlags :: CUInt -> [MDB_DbFlag]
+decompileDBFlags = decompileBitFlags dbFlags . fromIntegral
 
 data MDB_WriteFlag 
     = MDB_NOOVERWRITE
@@ -489,6 +501,12 @@ _throwLMDBErrNum context errNum = do
 
 
 -- | Allocate an environment object. This doesn't open the environment.
+--
+-- After creation, but before opening, please use:
+-- 
+--   mdb_env_set_mapsize 
+--   mdb_env_set_maxreaders
+--   mdb_env_set_maxdbs
 -- 
 -- In addition to normal LMDB errors, this operation may throw an
 -- MDB_VERSION_MISMATCH if the Haskell LMDB bindings doesn't match
@@ -519,7 +537,20 @@ versionMatch vA vB = matchMajor && matchMinor where
     matchMinor = ((==) `on` v_minor) vA vB
 
 -- | open or build a database in the filesystem. The named directory
--- must already exist and be writeable.
+-- must already exist and be writeable. 
+--
+-- Notes: 
+--  * before opening the environment, use mdb_env_set_mapsize.
+--  * for Haskell, always use the MDB_NOTLS flag. 
+--  * after opening the env
+-- After opening the environment, you should open the databases:
+--
+--    Create the environment.
+--    Open a transaction.
+--    Open all DBI handles the app will need.
+--    Commit the transaction.
+--    Use those DBI handles 
+-- 
 mdb_env_open :: MDB_env -> FilePath -> [MDB_EnvFlag] -> IO ()
 mdb_env_open env fp flags = 
     let iFlags = compileEnvFlags flags in
@@ -554,20 +585,105 @@ mdb_env_info env =
         if (0 == rc) then peek pInfo else
         _throwLMDBErrNum "mdb_env_info" rc
 
+-- | Initiate synchronization of environment with disk. However, if
+-- the MDB_NOSYNC or MDB_MAPASYNC flags are active, this won't wait
+-- for the operation to finish. Cf. mdb_env_sync_flush.
+mdb_env_sync :: MDB_env -> IO ()
+mdb_env_sync env =
+    _mdb_env_sync env 0 >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_env_sync" rc)
 
+-- | Force buffered writes to disk before returning.
+mdb_env_sync_flush :: MDB_env -> IO ()
+mdb_env_sync_flush env = 
+    _mdb_env_sync env 1 >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_env_sync_flush" rc)
+
+-- | Close the environment. The MDB_env object should not be used by
+-- any operations during or after closing.
+mdb_env_close  :: MDB_env -> IO ()
+mdb_env_close = _mdb_env_close
+
+-- | Set flags for the environment.
+mdb_env_set_flags :: MDB_env -> [MDB_EnvFlag] -> IO ()
+mdb_env_set_flags env flags = 
+    _mdb_env_set_flags env (compileEnvFlags flags) 1 >>= \ rc ->
+    unless (0 == rc) $ _throwLMDBErrNum "mdb_env_set_flags" rc
+
+-- | Unset flags for the environment.
+mdb_env_unset_flags :: MDB_env -> [MDB_EnvFlag] -> IO ()
+mdb_env_unset_flags env flags = 
+    _mdb_env_set_flags env (compileEnvFlags flags) 0 >>= \ rc ->
+    unless (0 == rc) $ _throwLMDBErrNum "mdb_env_unset_flags" rc
+
+-- | View the current set of flags for the environment.
+mdb_env_get_flags :: MDB_env -> IO [MDB_EnvFlag]
+mdb_env_get_flags env = alloca $ \ pFlags ->
+    _mdb_env_get_flags env pFlags >>= \ rc ->
+    if (0 == rc) then decompileEnvFlags <$> peek pFlags else
+    _throwLMDBErrNum "mdb_env_get_flags" rc
+
+-- | Obtain filesystem path for this environment.
+mdb_env_get_path :: MDB_env -> IO FilePath
+mdb_env_get_path env = alloca $ \ pPathStr ->
+    _mdb_env_get_path env pPathStr >>= \ rc ->
+    if (0 == rc) then peekCString =<< peek pPathStr else 
+    _throwLMDBErrNum "mdb_env_get_path" rc
+
+-- | Set the memory map size, in bytes, for this environment. This 
+-- determines the maximum size for the environment and databases, 
+-- but typically only a small fraction of the database is in memory
+-- at any given moment. 
+--
+-- It is not a problem to set this to a very large number, hundreds
+-- of gigabytes or even terabytes, assuming a sufficiently large 
+-- address space. It should be set to a multiple of page size.
+--
+-- The default map size is 1MB, intentionally set low to force 
+-- developers to select something larger.
+mdb_env_set_mapsize :: MDB_env -> Int -> IO ()
+mdb_env_set_mapsize env nBytes = 
+    _mdb_env_set_mapsize env (fromIntegral nBytes) >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_env_set_mapsize" rc)
+
+-- | Set the maximum number of concurrent readers.
+mdb_env_set_maxreaders :: MDB_env -> Int -> IO ()
+mdb_env_set_maxreaders env nReaders =
+    _mdb_env_set_maxreaders env (fromIntegral nReaders) >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_env_set_maxreaders" rc)
+
+-- | Get the maximum number of concurrent readers.
+mdb_env_get_maxreaders :: MDB_env -> IO Int
+mdb_env_get_maxreaders env = alloca $ \ pCount ->
+    _mdb_env_get_maxreaders env pCount >>= \ rc ->
+    if (0 == rc) then fromIntegral <$> _peekCUInt pCount else
+    _throwLMDBErrNum "mdb_env_get_maxreaders" rc
+
+-- | Set the maximum number of named databases. LMDB is designed to
+-- support a small handful of databases. 
+mdb_env_set_maxdbs :: MDB_env -> Int -> IO ()
+mdb_env_set_maxdbs env nDBs = 
+    _mdb_env_set_maxdbs env (fromIntegral nDBs) >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_env_set_maxdbs" rc)
+
+-- | Key sizes in LMDB are determined by a compile-time constant,
+-- defaulting to 511 bytes. This function returns the maximum.
+mdb_env_get_maxkeysize :: MDB_env -> IO Int
+mdb_env_get_maxkeysize env = fromIntegral <$> _mdb_env_get_maxkeysize env
+
+-- | Begin a new read-write transaction. Use mdb_txn_begin_rdonly for
+-- a read-only transaction.
+--
+-- Note: read-write transactions MUST operate in an OS bound thread. 
+-- This requirement is checked.
+--
+-- Read-only transactions may operate in unbound threads if the 
+-- MDB_NOTLS option is set. You should always set the MDB_NOTLS
+-- option for Haskell bindings to LMDB. 
 
 
 
 {-
-foreign import ccall "lmdb.h mdb_env_sync" _mdb_env_sync :: MDB_env -> CInt -> IO CInt
-foreign import ccall "lmdb.h mdb_env_close" _mdb_env_close :: MDB_env -> IO ()
-foreign import ccall "lmdb.h mdb_env_set_flags" _mdb_env_set_flags :: MDB_env -> CUInt -> CInt -> IO CInt
-foreign import ccall "lmdb.h mdb_env_get_flags" _mdb_env_get_flags :: MDB_env -> Ptr CUInt -> IO CInt
-foreign import ccall "lmdb.h mdb_env_set_mapsize" _mdb_env_set_mapsize :: MDB_env -> CSize -> IO CInt
-foreign import ccall "lmdb.h mdb_env_set_maxreaders" _mdb_env_set_maxreaders :: MDB_env -> CUInt -> IO CInt
-foreign import ccall "lmdb.h mdb_env_get_maxreaders" _mdb_env_get_maxreaders :: MDB_env -> Ptr CUInt -> IO CInt
-foreign import ccall "lmdb.h mdb_env_set_maxdbs" _mdb_env_set_maxdbs :: MDB_env -> MDB_dbi_t -> IO CInt
-foreign import ccall "lmdb.h mdb_env_get_maxkeysize" _mdb_env_get_maxkeysize :: MDB_env -> IO CInt
 
 foreign import ccall "lmdb.h mdb_txn_begin" _mdb_txn_begin :: MDB_env -> MDB_txn -> CUInt -> Ptr (Ptr MDB_txn) -> IO CInt
 foreign import ccall "lmdb.h mdb_txn_env" _mdb_txn_env :: MDB_txn -> IO (Ptr MDB_env)

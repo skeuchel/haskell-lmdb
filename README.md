@@ -37,11 +37,3 @@ Fortunately, LMDB supports an `MDB_NOTLS` option to support the M:N threading mo
 
 To avoid copies of data, it is possible to use `fromForeignPointer` from the `Data.ByteString.Internal` package. However, we'll need to be careful because this foriegn pointer may become invalid after a transaction. A potential approach is to protect these pointers via the type system, in a manner similar to STRef, and limit them to simple indexing and slicing operations (and fmap'd functions).
 
-# Hints
-
-Before starting any other threads:
-  Create the environment.
-  Open a transaction.
-  Open all DBI handles the app will need.
-  Commit the transaction.
-
