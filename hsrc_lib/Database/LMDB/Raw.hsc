@@ -10,6 +10,20 @@
 -- * File handle operations are not supported.
 -- * Unix mode fixed at 660 (read-write for user+group).
 --
+-- Concerns: interaction with mutexes...
+--
+-- Thoughts: what about safe vs. unsafe FFI bindings?
+--
+-- For now, I'll keep everything safe. But it might be a useful
+-- performance tweak to reduce some of these to unsafe bindings.
+--
+-- If I can track which databases use user-defined key or data
+-- comparison operations, I can potentially use 'unsafe' bindings
+-- for some databases and not for others. But I'll need to review
+-- the mdb.c code further before I feel comfortable with this.
+--
+-- So, I can potentially achieve significant performance gains.
+--
 module Database.LMDB.Raw
     ( LMDB_Version(..), lmdb_version, lmdb_dyn_version
     , LMDB_Error(..), MDB_ErrCode(..)
@@ -102,6 +116,7 @@ import Data.Function (on)
 
 #let alignment t = "%lu", (unsigned long)offsetof(struct {char x__; t (y__); }, y__)
 
+-- FFI
 foreign import ccall "lmdb.h mdb_version" _mdb_version :: Ptr CInt -> Ptr CInt -> Ptr CInt -> IO CString
 foreign import ccall "lmdb.h mdb_strerror" _mdb_strerror :: CInt -> CString 
 

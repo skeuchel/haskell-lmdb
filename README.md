@@ -32,8 +32,12 @@ The challenges in making LMDB available to Haskell involve:
 
 1. interaction with Haskell's green threads model
 2. minimize unnecessary copies of data.
+3. decide 'safe' vs. 'unsafe' FFI calls.
 
-Fortunately, LMDB supports an `MDB_NOTLS` option to support the M:N threading models. Unfortunately, this only impacts read-only transactions; a writer transaction must operate in a specific bound thread. This is doable, but a little annoying. It would be preferable if `MDB_NOTLS` also applied to writers and the write locks.
+Fortunately, LMDB supports an `MDB_NOTLS` option to support the M:N threading models. Unfortunately, this might not be enough. It isn't very clear what happens when multiple writers try to grab the same writer mutex. I might need to model writer locks more explicitly at the Haskell layer. Haskell's FFI will spin up new threads while waiting on a mutex, but it would be a problem if a second writer locked up the first thread (or acquired it) because the OS layer write-mutex wasn't aware of Haskell threads. (Fortunately, this is quite feasible... just rather annoying.)
 
 To avoid copies of data, it is possible to use `fromForeignPointer` from the `Data.ByteString.Internal` package. However, we'll need to be careful because this foriegn pointer may become invalid after a transaction. A potential approach is to protect these pointers via the type system, in a manner similar to STRef, and limit them to simple indexing and slicing operations (and fmap'd functions).
+
+Safe and unsafe FFI calls are quite a challenge. It seems I might have different behaviors for different databases, i.e. operations on a database with a user-configured comparison function need to use 'safe' calls. Potentially, use of unsafe calls could offer a significant performance advantage by avoiding "thread juggling" during normal gets and puts and iteration.
+
 
