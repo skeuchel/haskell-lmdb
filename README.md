@@ -1,7 +1,9 @@
 haskell-lmdb
 ============
 
-Bindings for LMDB from Haskell. This will be released as just the `lmdb` package on hackage, since the Haskell aspect is implicit. To install haskell-lmdb, you'll need to first install the lmdb development files (e.g. `sudo apt-get install liblmdb-dev` would work in Ubuntu). You'll also need to `cabal install c2hs` if you don't already have it.
+Bindings for LMDB from Haskell. This will be released as just the `lmdb` package on hackage, since the Haskell aspect is implicit. To install haskell-lmdb, you'll need to first install the lmdb development files (e.g. `sudo apt-get install liblmdb-dev` works in at least my version of Ubuntu). 
+
+These bindings are developed against LMDB 0.9.10. 
 
 # Lightning MDB
 
@@ -24,20 +26,22 @@ Known weaknesses of LMDB:
 * The database only ever grows. No direct support for compacting.
 * Set a maximum database size (weakness or strength?) when opening.
 
-Many of these weaknesses could be mitigated through a high-level binding, e.g. leveraging STM-like abstractions. But this package aims to present LMDB as it exists, with only a thin layer for extra safety.
+This package aims to present LMDB as it exists, with a relatively thin layer for safety.
 
 # Haskell Bindings
 
-The challenges in making LMDB available to Haskell involve:
+There are two main bindings to LMDB from Haskell. 
 
-1. interaction with Haskell's green threads model
-2. minimize unnecessary copies of data.
-3. decide 'safe' vs. 'unsafe' FFI calls.
+1. `Database.LMDB.Raw`, which is mostly faithful to `#include <lmdb.h>` in C.
+2. `Database.LMDB`, which provides a monadic interface with bytestring values.
 
-Fortunately, LMDB supports an `MDB_NOTLS` option to support the M:N threading models. Unfortunately, this might not be enough. It isn't very clear what happens when multiple writers try to grab the same writer mutex. I might need to model writer locks more explicitly at the Haskell layer. Haskell's FFI will spin up new threads while waiting on a mutex, but it would be a problem if a second writer locked up the first thread (or acquired it) because the OS layer write-mutex wasn't aware of Haskell threads. (Fortunately, this is quite feasible... just rather annoying.)
+The raw interface does follow Haskell conventions, e.g. representing flag fields with lists or unexpected errors via exceptions. However, there are many safety caveats for the raw interface:
 
-To avoid copies of data, it is possible to use `fromForeignPointer` from the `Data.ByteString.Internal` package. However, we'll need to be careful because this foriegn pointer may become invalid after a transaction. A potential approach is to protect these pointers via the type system, in a manner similar to STRef, and limit them to simple indexing and slicing operations (and fmap'd functions).
+* write transactions must use an OS bound thread
+* an `MDB_val` mustn't be used outside its transaction
+* read-only transactions cannot be used for writes
+* don't open the same environment file twice
 
-Safe and unsafe FFI calls are quite a challenge. It seems I might have different behaviors for different databases, i.e. operations on a database with a user-configured comparison function need to use 'safe' calls. Potentially, use of unsafe calls could offer a significant performance advantage by avoiding "thread juggling" during normal gets and puts and iteration.
+The `Database.LMDB` interface offers some greater convenience and safety, and should have a negligible impact on performance.
 
-
+*Aside:* These bindings use an internal mutex to prevent multiple concurrent write transactions from the Haskell layer. M:N threading + concurrent writers is a buggy combination for LMDB 0.9.10. 
