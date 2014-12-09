@@ -3,7 +3,7 @@ haskell-lmdb
 
 Bindings for LMDB from Haskell. This will be released as just the `lmdb` package on hackage, since the Haskell aspect is implicit. To install haskell-lmdb, you'll need to first install the lmdb development files (e.g. `sudo apt-get install liblmdb-dev` works in at least my version of Ubuntu). 
 
-These bindings are developed against LMDB 0.9.10. 
+These bindings are developed against LMDB 0.9.10. If LMDB is updated in a significant way that e.g. adds new features or relaxes old constraints, and it isn't clear that I've already noticed, please file an issue report! (Or a pull request.)
 
 # Lightning MDB
 
@@ -28,7 +28,7 @@ Known weaknesses of LMDB:
 
 This package aims to present LMDB as it exists, with a relatively thin layer for safety.
 
-# Haskell Bindings
+# Haskell Bindings to LMDB
 
 There are two main bindings to LMDB from Haskell. 
 
@@ -40,8 +40,12 @@ The raw interface does follow Haskell conventions, e.g. representing flag fields
 * write transactions must use an OS bound thread
 * an `MDB_val` mustn't be used outside its transaction
 * read-only transactions cannot be used for writes
-* don't open the same environment file twice
+* every process must use the same comparison functions
+* don't open the same environment file twice!
 
-The `Database.LMDB` interface offers some greater convenience and safety, and should have a negligible impact on performance.
+LMDB's writer mutex, which is held for the full duration of a write transaction, causes all sorts of problems for Haskell's lightweight threads. I currently introduce a simple `MVar` mutex at the `MDB_env` layer. Opening the same environment twice (concurrently) would bypass this. Fortunately, the expected use-case for LMDB is to open an environment once when the application starts up, then keep it open until the application shuts down or crashes.
 
-*Aside:* These bindings use an internal mutex to prevent multiple concurrent write transactions from the Haskell layer. M:N threading + concurrent writers is a buggy combination for LMDB 0.9.10. 
+Safe FFI calls are enough overhead to significantly impact a microbenchmark reading the LMDB database (especially if we read it sequentially). This might not be a big deal for 'real' code, where we perform any significant processing of returned values. But, in the interest of performance freaks like me, the 'raw' interface exports the read/write/cursor operations twice: once with `MDB_dbi` and again for `MDB_dbi'` (and similar for cursors). The difference between these is that the `MDB_dbi` allows user-defined comparisons but requires 'safe' FFI calls (which adds ~100ns overhead), while `MDB_dbi'` uses unsafe FFI calls but forbids user-defined comparisons (which adds ~10ns overhead). 
+
+Likely, most users neither need nor want safe FFI for most databases.
+
