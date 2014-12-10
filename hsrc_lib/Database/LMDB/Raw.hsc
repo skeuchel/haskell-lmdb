@@ -7,7 +7,7 @@
 -- * Errors are shifted to `LMDB_Error` Haskell exceptions
 -- * flag fields and enums are represented with Haskell types
 -- * MDB_env includes its own write mutex for Haskell's threads
--- * MDB_RESERVE operations separated into their own functions
+-- * MDB_RESERVE operations use their own functions
 -- * Databases types are divided for user-defined comparisons
 -- * Boolean-option functions are divided into two functions
 -- * MDB_NOTLS is added implicitly, and may not be removed
@@ -15,7 +15,9 @@
 --
 -- Some functions come in two forms based on 'safe' vs. 'unsafe'
 -- FFI bindings. Unsafe FFI bindings are unsuitable for databases
--- with user-defined comparison operations.
+-- with user-defined comparison operations. (Though, if you plan
+-- to load a database with MDB_APPEND or MDB_APPENDDUP, you can
+-- use an unsafe dbi for just that portion.)
 -- 
 -- Despite these provisions, developers must still be cautious:
 --
@@ -30,6 +32,10 @@
 --
 -- * functions directly using file handles 
 -- * user-defined relocation functions 
+-- * alloc-avoiding renew and reset operations
+--
+-- * MDB_MULTIPLE is not currently supported (todo)
+-- * cursor write (put,del) not currently supported (todo)
 -- 
 module Database.LMDB.Raw
     ( LMDB_Version(..), lmdb_version, lmdb_dyn_version
@@ -44,7 +50,9 @@ module Database.LMDB.Raw
     , MDB_stat, ms_psize, ms_depth, ms_branch_pages, ms_leaf_pages, ms_overflow_pages, ms_entries
     , MDB_envinfo, me_mapaddr, me_mapsize, me_last_pgno, me_last_txnid, me_maxreaders, me_numreaders
     , MDB_cmp_func, wrapCmpFn
-    , MDB_EnvFlag(..), MDB_DbFlag(..)
+    , MDB_EnvFlag(..)
+    , MDB_DbFlag(..)
+
     , MDB_WriteFlag(..), MDB_WriteFlags, compileWriteFlags
     --, MDB_cursor_op(..)
 
@@ -70,8 +78,6 @@ module Database.LMDB.Raw
     , mdb_txn_env
     , mdb_txn_commit
     , mdb_txn_abort
-    , mdb_txn_reset
-    , mdb_txn_renew
 
     -- | Databases
     , mdb_dbi_open
@@ -96,31 +102,26 @@ module Database.LMDB.Raw
     , mdb_cmp, mdb_dcmp
     , mdb_cmp', mdb_dcmp'
 
-    
-
-    
-
-    
-
-{-
-
-    -- | Cursors
+    -- | Cursor Meta
     , mdb_cursor_open
     , mdb_cursor_close
-    , mdb_cursor_renew
     , mdb_cursor_txn
     , mdb_cursor_dbi
-    , mdb_cursor_get
-    , mdb_cursor_put
-    , mdb_cursor_del
     , mdb_cursor_count
 
+    , mdb_cursor_open'
+    , mdb_cursor_close'
+    , mdb_cursor_txn'
+    , mdb_cursor_dbi'
+    , mdb_cursor_count'
+
+    -- | Cursor Access
+    --, mdb_cursor_get
+    --, mdb_cursor_get'
+
     -- | Misc
-    , mdb_cmp
-    , mdb_dcmp
     , mdb_reader_list
     , mdb_reader_check
--}
     ) where
 
 #include <lmdb.h>
@@ -137,6 +138,7 @@ import Data.Typeable
 --import System.IO (FilePath)
 import Data.Function (on)
 import Data.Maybe (isNothing)
+import Data.IORef
 
 #let alignment t = "%lu", (unsigned long)offsetof(struct {char x__; t (y__); }, y__)
 
@@ -166,8 +168,6 @@ foreign import ccall "lmdb.h mdb_txn_begin" _mdb_txn_begin :: Ptr MDB_env -> Ptr
 -- foreign import ccall "lmdb.h mdb_txn_env" _mdb_txn_env :: MDB_txn -> IO (Ptr MDB_env)
 foreign import ccall "lmdb.h mdb_txn_commit" _mdb_txn_commit :: Ptr MDB_txn -> IO CInt
 foreign import ccall "lmdb.h mdb_txn_abort" _mdb_txn_abort :: Ptr MDB_txn -> IO ()
-foreign import ccall "lmdb.h mdb_txn_reset" _mdb_txn_reset :: Ptr MDB_txn -> IO ()
-foreign import ccall "lmdb.h mdb_txn_renew" _mdb_txn_renew :: Ptr MDB_txn -> IO CInt
 
 -- I'm hoping to get a patch adding the following function into LMDB: 
 -- foreign import ccall "lmdb.h mdb_txn_id" _mdb_txn_id :: MDB_txn -> IO MDB_txnid_t 
@@ -182,33 +182,34 @@ foreign import ccall "lmdb.h mdb_drop" _mdb_drop :: Ptr MDB_txn -> MDB_dbi_t -> 
 foreign import ccall "lmdb.h mdb_set_compare" _mdb_set_compare :: Ptr MDB_txn -> MDB_dbi -> FunPtr MDB_cmp_func -> IO CInt
 foreign import ccall "lmdb.h mdb_set_dupsort" _mdb_set_dupsort :: Ptr MDB_txn -> MDB_dbi -> FunPtr MDB_cmp_func -> IO CInt
 
+foreign import ccall safe "lmdb.h mdb_cmp" _mdb_cmp :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+foreign import ccall safe "lmdb.h mdb_dcmp" _mdb_dcmp :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+foreign import ccall unsafe "lmdb.h mdb_cmp" _mdb_cmp' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+foreign import ccall unsafe "lmdb.h mdb_dcmp" _mdb_dcmp' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+
 foreign import ccall safe "lmdb.h mdb_get" _mdb_get :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
 foreign import ccall safe "lmdb.h mdb_put" _mdb_put :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
 foreign import ccall safe "lmdb.h mdb_del" _mdb_del :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+foreign import ccall unsafe "lmdb.h mdb_get" _mdb_get' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+foreign import ccall unsafe "lmdb.h mdb_put" _mdb_put' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
+foreign import ccall unsafe "lmdb.h mdb_del" _mdb_del' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+
+-- I really hate LMDB's cursor interface: one function with 18 special cases.
 foreign import ccall safe "lmdb.h mdb_cursor_open" _mdb_cursor_open :: Ptr MDB_txn -> MDB_dbi -> Ptr (Ptr MDB_cursor) -> IO CInt
 foreign import ccall safe "lmdb.h mdb_cursor_close" _mdb_cursor_close :: Ptr MDB_cursor -> IO ()
-foreign import ccall safe "lmdb.h mdb_cursor_renew" _mdb_cursor_renew :: Ptr MDB_txn -> Ptr MDB_cursor -> IO CInt
 foreign import ccall safe "lmdb.h mdb_cursor_get" _mdb_cursor_get :: Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> (#type MDB_cursor_op) -> IO CInt
 foreign import ccall safe "lmdb.h mdb_cursor_put" _mdb_cursor_put :: Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
 foreign import ccall safe "lmdb.h mdb_cursor_del" _mdb_cursor_del :: Ptr MDB_cursor -> MDB_WriteFlags -> IO CInt
 foreign import ccall safe "lmdb.h mdb_cursor_count" _mdb_cursor_count :: Ptr MDB_cursor -> Ptr CSize -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cmp" _mdb_cmp :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
-foreign import ccall safe "lmdb.h mdb_dcmp" _mdb_dcmp :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
 -- foreign import ccall safe "lmdb.h mdb_cursor_txn" _mdb_cursor_txn :: Ptr MDB_cursor -> IO (Ptr MDB_txn)
 -- foreign import ccall safe "lmdb.h mdb_cursor_dbi" _mdb_cursor_dbi :: Ptr MDB_cursor -> IO MDB_dbi
 
-foreign import ccall unsafe "lmdb.h mdb_get" _mdb_get' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_put" _mdb_put' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_del" _mdb_del' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
 foreign import ccall unsafe "lmdb.h mdb_cursor_open" _mdb_cursor_open' :: Ptr MDB_txn -> MDB_dbi' -> Ptr (Ptr MDB_cursor') -> IO CInt
 foreign import ccall unsafe "lmdb.h mdb_cursor_close" _mdb_cursor_close' :: Ptr MDB_cursor' -> IO ()
-foreign import ccall unsafe "lmdb.h mdb_cursor_renew" _mdb_cursor_renew' :: Ptr MDB_txn -> Ptr MDB_cursor' -> IO CInt
 foreign import ccall unsafe "lmdb.h mdb_cursor_get" _mdb_cursor_get' :: Ptr MDB_cursor' -> Ptr MDB_val -> Ptr MDB_val -> (#type MDB_cursor_op) -> IO CInt
 foreign import ccall unsafe "lmdb.h mdb_cursor_put" _mdb_cursor_put' :: Ptr MDB_cursor' -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
 foreign import ccall unsafe "lmdb.h mdb_cursor_del" _mdb_cursor_del' :: Ptr MDB_cursor' -> MDB_WriteFlags -> IO CInt
 foreign import ccall unsafe "lmdb.h mdb_cursor_count" _mdb_cursor_count' :: Ptr MDB_cursor' -> Ptr CSize -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_cmp" _mdb_cmp' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_dcmp" _mdb_dcmp' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
 -- foreign import ccall unsafe "lmdb.h mdb_cursor_txn" _mdb_cursor_txn' :: Ptr MDB_cursor -> IO (Ptr MDB_txn)
 -- foreign import ccall unsafe "lmdb.h mdb_cursor_dbi" _mdb_cursor_dbi' :: Ptr MDB_cursor -> IO MDB_dbi
 
@@ -445,22 +446,22 @@ decompileDBFlags = decompileBitFlags dbFlags . fromIntegral
 data MDB_WriteFlag 
     = MDB_NOOVERWRITE
     | MDB_NODUPDATA
-    | MDB_CURRENT
-    -- | MDB_RESERVE    -- (special handling)
-    | MDB_APPEND
-    | MDB_APPENDDUP
-    | MDB_MULTIPLE
+    -- | MDB_CURRENT  -- (cursor writes not supported for now)
+    -- | MDB_RESERVE  -- (needs dedicated function)
+    | MDB_APPEND     -- separate function
+    | MDB_APPENDDUP  -- separate function
+    -- | MDB_MULTIPLE -- (needs special handling)
     deriving (Eq, Ord, Bounded, A.Ix, Show)
 
 writeFlags :: [(MDB_WriteFlag, Int)]
 writeFlags =
     [(MDB_NOOVERWRITE, #const MDB_NOOVERWRITE)
     ,(MDB_NODUPDATA, #const MDB_NODUPDATA)
-    ,(MDB_CURRENT, #const MDB_CURRENT)
+    -- ,(MDB_CURRENT, #const MDB_CURRENT)
     -- ,(MDB_RESERVE, #const MDB_RESERVE)
     ,(MDB_APPEND, #const MDB_APPEND)
     ,(MDB_APPENDDUP, #const MDB_APPENDDUP)
-    ,(MDB_MULTIPLE, #const MDB_MULTIPLE)
+    -- ,(MDB_MULTIPLE, #const MDB_MULTIPLE)
     ]
 
 writeFlagsArray :: A.UArray MDB_WriteFlag Int
@@ -476,6 +477,7 @@ compileWriteFlags :: [MDB_WriteFlag] -> MDB_WriteFlags
 compileWriteFlags = MDB_WriteFlags . L.foldl' addWF 0 where
     addWF n wf = n .|. fromIntegral (writeFlagsArray A.! wf)
 
+{-
 data MDB_cursor_op
     = MDB_FIRST
     | MDB_FIRST_DUP
@@ -524,7 +526,7 @@ cursorOpsArray = A.accumArray (flip const) minBound (minBound,maxBound) cursorOp
 
 vCursorOp :: MDB_cursor_op -> (#type MDB_cursor_op)
 vCursorOp = fromIntegral . (A.!) cursorOpsArray
-
+-}
 
 -- | Error codes from MDB. Note, however, that this API for MDB will mostly
 -- use exceptions for any non-successful return codes. This is mostly included
@@ -776,6 +778,31 @@ mdb_env_set_maxdbs env nDBs =
 mdb_env_get_maxkeysize :: MDB_env -> IO Int
 mdb_env_get_maxkeysize env = fromIntegral <$> _mdb_env_get_maxkeysize (_env_ptr env)
 
+-- | Check for stale readers, and return number of stale readers cleared.
+mdb_reader_check :: MDB_env -> IO Int
+mdb_reader_check env = 
+    alloca $ \ pCount ->
+    _mdb_reader_check (_env_ptr env) pCount >>= \ rc ->
+    if (0 == rc) then fromIntegral <$> _peekCInt pCount else
+    _throwLMDBErrNum "mdb_reader_check" rc 
+
+-- | Dump entries from reader lock table.
+mdb_reader_list :: MDB_env -> IO [String]
+mdb_reader_list env =
+    newIORef [] >>= \ rf ->
+    let onMsg cs _ = 
+            peekCString cs >>= \ msg ->
+            modifyIORef rf (msg:) >>
+            return 0
+    in
+    withMsgFunc onMsg $ \ pMsgFunc ->
+    _mdb_reader_list (_env_ptr env) pMsgFunc nullPtr >>= \ rc ->
+    if (0 == rc) then L.reverse <$> readIORef rf else
+    _throwLMDBErrNum "mdb_reader_list" rc
+
+withMsgFunc :: MDB_msg_func -> (FunPtr MDB_msg_func -> IO a) -> IO a
+withMsgFunc f = bracket (wrapMsgFunc f) freeHaskellFunPtr
+
 -- | Begin a new transaction, possibly read-only, with a possible parent.
 --
 --     mdb_txn_begin env parent bReadOnly
@@ -877,21 +904,6 @@ mdb_txn_abort :: MDB_txn -> IO ()
 mdb_txn_abort txn = mask_ $ 
     _mdb_txn_abort (_txn_ptr txn) >> 
     _unlockTxn txn
-
--- | Reset a read-only transaction.
---
--- Note: While lmdb.h doesn't return any error conditions, this Haskell
--- binding will throw an LMDB_Error (MDB_BAD_TXN) if the argument is not
--- read-only.
-mdb_txn_reset :: MDB_txn -> IO ()
-mdb_txn_reset txn | _txn_rw txn = _throwLMDBErrNum "mdb_txn_reset" (#const MDB_BAD_TXN)
-                  | otherwise = _mdb_txn_reset (_txn_ptr txn)
-
--- | Renew a read-only transaction that was previously reset.
-mdb_txn_renew :: MDB_txn -> IO ()
-mdb_txn_renew txn = 
-    _mdb_txn_renew (_txn_ptr txn) >>= \ rc ->
-    unless (0 == rc) (_throwLMDBErrNum "mdb_txn_renew" rc)
 
 {-
 
@@ -1010,13 +1022,22 @@ mdb_get txn dbi key =
     _throwLMDBErrNum "mdb_get" rc
 
 -- | Add a (key,value) pair to the database.
-mdb_put :: MDB_WriteFlags -> MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO ()
+--
+-- Returns False on MDB_KEYEXIST, and True on MDB_SUCCESS. Any other
+-- return value results in an exception. 
+mdb_put :: MDB_WriteFlags -> MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO Bool
 mdb_put wf txn dbi key val =
     allocaBytes (2 * sizeOf key) $ \ pKey ->
     let pVal = pKey `plusPtr` sizeOf key in
     poke pKey key >> poke pVal val >>
     _mdb_put (_txn_ptr txn) dbi pKey pVal wf >>= \ rc ->
-    unless (0 == rc) (_throwLMDBErrNum "mdb_put" rc)
+    r_put rc
+
+r_put :: CInt -> IO Bool
+r_put rc =
+    if (0 == rc) then return True else
+    if ((#const MDB_KEYEXIST) == rc) then return False else
+    _throwLMDBErrNum "mdb_put" rc
 
 -- | Allocate space for data under a given key. This space must be
 -- filled before the write transaction commits. The idea here is to
@@ -1024,7 +1045,8 @@ mdb_put wf txn dbi key val =
 --
 --     mdb_reserve flags txn dbi key byteCount
 --
--- Note: not safe to use with MDB_DUPSORT. 
+-- Note: not safe to use with MDB_DUPSORT.
+-- Note: MDB_KEYEXIST will result in an exception here.
 mdb_reserve :: MDB_WriteFlags -> MDB_txn -> MDB_dbi -> MDB_val -> Int -> IO MDB_val
 mdb_reserve wf txn dbi key szBytes =
     allocaBytes (2 * sizeOf key) $ \ pKey ->
@@ -1076,14 +1098,13 @@ mdb_get' txn dbi key =
     if ((#const MDB_NOTFOUND) == rc) then return Nothing else
     _throwLMDBErrNum "mdb_get" rc
 
-mdb_put' :: MDB_WriteFlags -> MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO ()
+mdb_put' :: MDB_WriteFlags -> MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO Bool
 mdb_put' wf txn dbi key val =
     allocaBytes (2 * sizeOf key) $ \ pKey ->
     let pVal = pKey `plusPtr` sizeOf key in
-    poke pKey key >> 
-    poke pVal val >>
+    poke pKey key >> poke pVal val >>
     _mdb_put' (_txn_ptr txn) dbi pKey pVal wf >>= \ rc ->
-    unless (0 == rc) (_throwLMDBErrNum "mdb_put" rc)
+    r_put rc
 
 mdb_reserve' :: MDB_WriteFlags -> MDB_txn -> MDB_dbi' -> MDB_val -> Int -> IO MDB_val
 mdb_reserve' wf txn dbi key szBytes =
@@ -1141,89 +1162,79 @@ mdb_dcmp' txn dbi a b =
     _mdb_dcmp' (_txn_ptr txn) dbi pA pB >>= \ rc ->
     return (compare rc 0)
 
-{-
 -- | open a cursor for the database.
 mdb_cursor_open :: MDB_txn -> MDB_dbi -> IO MDB_cursor
-mdb_cursor_o
+mdb_cursor_open txn dbi =
+    alloca $ \ ppCursor ->
+    _mdb_cursor_open (_txn_ptr txn) dbi ppCursor >>= \ rc ->
+    if (0 /= rc) then _throwLMDBErrNum "mdb_cursor_open" rc else
+    peek ppCursor >>= \ pCursor ->
+    return $! MDB_cursor
+        { _crs_ptr = pCursor
+        , _crs_dbi = dbi
+        , _crs_txn = txn
+        }
 
--- | close a cursor. don't use after this.
+mdb_cursor_open' :: MDB_txn -> MDB_dbi' -> IO MDB_cursor'
+mdb_cursor_open' txn dbi = 
+    alloca $ \ ppCursor ->
+    _mdb_cursor_open' (_txn_ptr txn) dbi ppCursor >>= \ rc ->
+    if (0 /= rc) then _throwLMDBErrNum "mdb_cursor_open" rc else
+    peek ppCursor >>= \ pCursor ->
+    return $! MDB_cursor'
+        { _crs_ptr' = pCursor
+        , _crs_dbi' = dbi
+        , _crs_txn' = txn
+        }
+
+-- | Close a cursor. don't use after this. In general, cursors should 
+-- be closed before their associated transaction is commited or aborted.
 mdb_cursor_close :: MDB_cursor -> IO ()
+mdb_cursor_close crs = _mdb_cursor_close (_crs_ptr crs)
 
-mdb_cursor_renew :: MDB_txn -> MDB_cursor -> IO ()
+mdb_cursor_close' :: MDB_cursor' -> IO ()
+mdb_cursor_close' crs = _mdb_cursor_close' (_crs_ptr' crs)
+
+-- | Access transaction associated with a cursor.
+mdb_cursor_txn :: MDB_cursor -> MDB_txn
+mdb_cursor_txn = _crs_txn
+
+mdb_cursor_txn' :: MDB_cursor' -> MDB_txn
+mdb_cursor_txn' = _crs_txn'
+
+-- | Access the database associated with a cursor.
+mdb_cursor_dbi :: MDB_cursor -> MDB_dbi
+mdb_cursor_dbi = _crs_dbi
+
+mdb_cursor_dbi' :: MDB_cursor' -> MDB_dbi'
+mdb_cursor_dbi' = _crs_dbi'
+
+-- | count number of duplicate data items at cursor's current location.
+mdb_cursor_count :: MDB_cursor -> IO Int
+mdb_cursor_count crs = 
+    alloca $ \ pCount -> 
+    _mdb_cursor_count (_crs_ptr crs) pCount >>= \ rc ->
+    if (0 == rc) then fromIntegral <$> _peekSize pCount else
+    _throwLMDBErrNum "mdb_cursor_count" rc
+
+_peekSize :: Ptr CSize -> IO CSize
+_peekSize = peek
+
+mdb_cursor_count' :: MDB_cursor' -> IO Int
+mdb_cursor_count' crs = 
+    alloca $ \ pCount -> 
+    _mdb_cursor_count' (_crs_ptr' crs) pCount >>= \ rc ->
+    if (0 == rc) then fromIntegral <$> _peekSize pCount else
+    _throwLMDBErrNum "mdb_cursor_count" rc
 
 
-foreign import ccall safe "lmdb.h mdb_cursor_open" _mdb_cursor_open :: Ptr MDB_txn -> MDB_dbi -> Ptr (Ptr MDB_cursor) -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cursor_close" _mdb_cursor_close :: Ptr MDB_cursor -> IO ()
-foreign import ccall safe "lmdb.h mdb_cursor_renew" _mdb_cursor_renew :: Ptr MDB_txn -> Ptr MDB_cursor -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cursor_get" _mdb_cursor_get :: Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> (#type MDB_cursor_op) -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cursor_put" _mdb_cursor_put :: Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cursor_del" _mdb_cursor_del :: Ptr MDB_cursor -> MDB_WriteFlags -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cursor_count" _mdb_cursor_count :: Ptr MDB_cursor -> Ptr CSize -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cmp" _mdb_cmp :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
-foreign import ccall safe "lmdb.h mdb_dcmp" _mdb_dcmp :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
--- foreign import ccall safe "lmdb.h mdb_cursor_txn" _mdb_cursor_txn :: Ptr MDB_cursor -> IO (Ptr MDB_txn)
--- foreign import ccall safe "lmdb.h mdb_cursor_dbi" _mdb_cursor_dbi :: Ptr MDB_cursor -> IO MDB_dbi
--}
-
-{-
-	MDB_FIRST,				/**< Position at first key/data item */
-	MDB_FIRST_DUP,			/**< Position at first data item of current key.
-								Only for #MDB_DUPSORT */
-	MDB_GET_BOTH,			/**< Position at key/data pair. Only for #MDB_DUPSORT */
-	MDB_GET_BOTH_RANGE,		/**< position at key, nearest data. Only for #MDB_DUPSORT */
-	MDB_GET_CURRENT,		/**< Return key/data at current cursor position */
-	MDB_GET_MULTIPLE,		/**< Return all the duplicate data items at the current
-								 cursor position. Only for #MDB_DUPFIXED */
-	MDB_LAST,				/**< Position at last key/data item */
-	MDB_LAST_DUP,			/**< Position at last data item of current key.
-								Only for #MDB_DUPSORT */
-	MDB_NEXT,				/**< Position at next data item */
-	MDB_NEXT_DUP,			/**< Position at next data item of current key.
-								Only for #MDB_DUPSORT */
-	MDB_NEXT_MULTIPLE,		/**< Return all duplicate data items at the next
-								cursor position. Only for #MDB_DUPFIXED */
-	MDB_NEXT_NODUP,			/**< Position at first data item of next key */
-	MDB_PREV,				/**< Position at previous data item */
-	MDB_PREV_DUP,			/**< Position at previous data item of current key.
-								Only for #MDB_DUPSORT */
-	MDB_PREV_NODUP,			/**< Position at last data item of previous key */
-	MDB_SET,				/**< Position at specified key */
-	MDB_SET_KEY,			/**< Position at specified key, return key + data */
-	MDB_SET_RANGE			/**< Position at first key greater than or equal to specified key. */
--}
--- mdb_cursor_get :: MDB_cursor -> 
-
+-- for cursor get...
+--  I'm not really sure what I want to do here, not quite yet. 
+--  maybe I should write a bunch of individual functions?
 
 {-
-foreign import ccall safe "lmdb.h mdb_cursor_open" _mdb_cursor_open :: Ptr MDB_txn -> MDB_dbi -> Ptr (Ptr MDB_cursor) -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cursor_close" _mdb_cursor_close :: Ptr MDB_cursor -> IO ()
-foreign import ccall safe "lmdb.h mdb_cursor_renew" _mdb_cursor_renew :: Ptr MDB_txn -> Ptr MDB_cursor -> IO CInt
 foreign import ccall safe "lmdb.h mdb_cursor_get" _mdb_cursor_get :: Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> (#type MDB_cursor_op) -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cursor_put" _mdb_cursor_put :: Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cursor_del" _mdb_cursor_del :: Ptr MDB_cursor -> MDB_WriteFlags -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cursor_count" _mdb_cursor_count :: Ptr MDB_cursor -> Ptr CSize -> IO CInt
-foreign import ccall safe "lmdb.h mdb_cmp" _mdb_cmp :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
-foreign import ccall safe "lmdb.h mdb_dcmp" _mdb_dcmp :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
--- foreign import ccall safe "lmdb.h mdb_cursor_txn" _mdb_cursor_txn :: Ptr MDB_cursor -> IO (Ptr MDB_txn)
--- foreign import ccall safe "lmdb.h mdb_cursor_dbi" _mdb_cursor_dbi :: Ptr MDB_cursor -> IO MDB_dbi
-
-foreign import ccall unsafe "lmdb.h mdb_cursor_open" _mdb_cursor_open' :: Ptr MDB_txn -> MDB_dbi' -> Ptr (Ptr MDB_cursor') -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_cursor_close" _mdb_cursor_close' :: Ptr MDB_cursor' -> IO ()
-foreign import ccall unsafe "lmdb.h mdb_cursor_renew" _mdb_cursor_renew' :: Ptr MDB_txn -> Ptr MDB_cursor' -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_cursor_get" _mdb_cursor_get' :: Ptr MDB_cursor' -> Ptr MDB_val -> Ptr MDB_val -> (#type MDB_cursor_op) -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_cursor_put" _mdb_cursor_put' :: Ptr MDB_cursor' -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_cursor_del" _mdb_cursor_del' :: Ptr MDB_cursor' -> MDB_WriteFlags -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_cursor_count" _mdb_cursor_count' :: Ptr MDB_cursor' -> Ptr CSize -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_cmp" _mdb_cmp' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_dcmp" _mdb_dcmp' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
--- foreign import ccall unsafe "lmdb.h mdb_cursor_txn" _mdb_cursor_txn' :: Ptr MDB_cursor -> IO (Ptr MDB_txn)
--- foreign import ccall unsafe "lmdb.h mdb_cursor_dbi" _mdb_cursor_dbi' :: Ptr MDB_cursor -> IO MDB_dbi
-
-foreign import ccall "lmdb.h mdb_reader_list" _mdb_reader_list :: Ptr MDB_env -> FunPtr MDB_msg_func -> Ptr () -> IO CInt
-foreign import ccall "lmdb.h mdb_reader_check" _mdb_reader_check :: Ptr MDB_env -> Ptr CInt -> IO CInt
 -}
-
-
 
 {-
 cmpBytesToCmpFn :: (ByteString -> ByteString -> Ord) -> CmpFn
