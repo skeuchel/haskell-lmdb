@@ -785,8 +785,8 @@ mdb_reader_check env =
     if (0 == rc) then fromIntegral <$> _peekCInt pCount else
     _throwLMDBErrNum "mdb_reader_check" rc 
 
--- | Dump entries from reader lock table.
-mdb_reader_list :: MDB_env -> IO [String]
+-- | Dump entries from reader lock table (for human consumption)
+mdb_reader_list :: MDB_env -> IO String
 mdb_reader_list env =
     newIORef [] >>= \ rf ->
     let onMsg cs _ = 
@@ -796,7 +796,8 @@ mdb_reader_list env =
     in
     withMsgFunc onMsg $ \ pMsgFunc ->
     _mdb_reader_list (_env_ptr env) pMsgFunc nullPtr >>= \ rc ->
-    if (0 == rc) then L.reverse <$> readIORef rf else
+    let toMsg = L.foldl (flip (++)) [] in
+    if (0 == rc) then toMsg <$> readIORef rf else
     _throwLMDBErrNum "mdb_reader_list" rc
 
 withMsgFunc :: MDB_msg_func -> (FunPtr MDB_msg_func -> IO a) -> IO a
@@ -913,7 +914,10 @@ mdb_txn_abort txn = mask_ $
 
 -- | Open a database that supports user-defined comparisons, but
 -- has slightly more FFI overhead for reads and writes.
-mdb_dbi_open :: MDB_txn -> String -> [MDB_DbFlag] -> IO MDB_dbi
+--
+-- LMDB supports a small set of named databases, plus one 'main'
+-- database using the null argument for the database name.
+mdb_dbi_open :: MDB_txn -> Maybe String -> [MDB_DbFlag] -> IO MDB_dbi
 mdb_dbi_open txn dbName flags = MDB_dbi <$> mdb_dbi_open_t txn dbName flags
 
 -- | database statistics
@@ -942,7 +946,7 @@ mdb_drop txn = mdb_drop_t txn . _dbi
 mdb_clear :: MDB_txn -> MDB_dbi -> IO ()
 mdb_clear txn = mdb_clear_t txn . _dbi
 
-mdb_dbi_open' :: MDB_txn -> String -> [MDB_DbFlag] -> IO MDB_dbi'
+mdb_dbi_open' :: MDB_txn -> Maybe String -> [MDB_DbFlag] -> IO MDB_dbi'
 mdb_dbi_open' txn dbName flags = MDB_dbi' <$> mdb_dbi_open_t txn dbName flags
 
 mdb_stat' :: MDB_txn -> MDB_dbi' -> IO MDB_stat
@@ -961,8 +965,14 @@ mdb_clear' :: MDB_txn -> MDB_dbi' -> IO ()
 mdb_clear' txn = mdb_clear_t txn . _dbi'
 
 
-mdb_dbi_open_t :: MDB_txn -> String -> [MDB_DbFlag] -> IO MDB_dbi_t
-mdb_dbi_open_t txn dbName flags =
+mdb_dbi_open_t :: MDB_txn -> Maybe String -> [MDB_DbFlag] -> IO MDB_dbi_t
+mdb_dbi_open_t txn Nothing flags = -- use nullPtr for name
+    let cdbFlags = compileDBFlags flags in
+    alloca $ \ pDBI ->
+    _mdb_dbi_open (_txn_ptr txn) nullPtr cdbFlags pDBI >>= \ rc ->
+    if (0 == rc) then peek pDBI else
+    _throwLMDBErrNum "mdb_dbi_open" rc
+mdb_dbi_open_t txn (Just dbName) flags = -- use string name
     let cdbFlags = compileDBFlags flags in
     withCString dbName $ \ cdbName ->
     alloca $ \ pDBI ->
