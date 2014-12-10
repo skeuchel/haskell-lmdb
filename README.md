@@ -5,6 +5,8 @@ Bindings for LMDB from Haskell. This will be released as just the `lmdb` package
 
 These bindings are developed against LMDB 0.9.10. If LMDB is updated in a significant way that e.g. adds new features or relaxes old constraints, and it isn't clear that I've already noticed, please file an issue report! (Or a pull request.)
 
+Testing on these bindings is very light at the moment. Please report any issues. A code review would be welcome, too.
+
 # Lightning MDB
 
 [Lightning MDB](http://symas.com/mdb/) (LMDB) is a Berkeley DB replacement developed for the OpenLDAP project, primarily by Howard Chu and Symas Corp. Besides its performance, which is impressive, LMDB has a lot to offer: 

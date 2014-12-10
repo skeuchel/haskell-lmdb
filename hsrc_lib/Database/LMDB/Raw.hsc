@@ -7,6 +7,7 @@
 -- * Errors are shifted to `LMDB_Error` Haskell exceptions
 -- * flag fields and enums are represented with Haskell types
 -- * MDB_env includes its own write mutex for Haskell's threads
+-- * MDB_RESERVE operations separated into their own functions
 -- * Databases types are divided for user-defined comparisons
 -- * Boolean-option functions are divided into two functions
 -- * MDB_NOTLS is added implicitly, and may not be removed
@@ -45,7 +46,7 @@ module Database.LMDB.Raw
     , MDB_cmp_func, wrapCmpFn
     , MDB_EnvFlag(..), MDB_DbFlag(..)
     , MDB_WriteFlag(..), MDB_WriteFlags, compileWriteFlags
-    -- , MDB_cursor_op(..)
+    --, MDB_cursor_op(..)
 
     -- | Environment Operations
     , mdb_env_create
@@ -78,6 +79,8 @@ module Database.LMDB.Raw
     , mdb_dbi_flags
     , mdb_dbi_close
     , mdb_drop, mdb_clear
+    , mdb_set_compare
+    , mdb_set_dupsort
 
     , mdb_dbi_open'
     , mdb_stat'
@@ -85,23 +88,21 @@ module Database.LMDB.Raw
     , mdb_dbi_close'
     , mdb_drop', mdb_clear'
 
-{-
+    -- | Basic Key-Value Access
+    , mdb_get, mdb_put, mdb_del, mdb_reserve
+    , mdb_get', mdb_put', mdb_del', mdb_reserve'
 
-    -- | Databases
-    , mdb_dbi_open
-    , mdb_stat
-    , mdb_dbi_flags
-    , mdb_dbi_close
-    , mdb_drop, mdb_clear
-    , mdb_set_compare
-    , mdb_set_dupsort
-    -- , mdb_set_relfunc
-    -- , mdb_set_relctx
+    -- | Database key and value Comparisons
+    , mdb_cmp, mdb_dcmp
+    , mdb_cmp', mdb_dcmp'
+
     
-    -- | Access
-    , mdb_get
-    , mdb_put
-    , mdb_del, mdb_delKey
+
+    
+
+    
+
+{-
 
     -- | Cursors
     , mdb_cursor_open
@@ -133,7 +134,7 @@ import Control.Concurrent
 import qualified Data.Array.Unboxed as A
 import qualified Data.List as L
 import Data.Typeable
-import System.IO (FilePath)
+--import System.IO (FilePath)
 import Data.Function (on)
 import Data.Maybe (isNothing)
 
@@ -445,7 +446,7 @@ data MDB_WriteFlag
     = MDB_NOOVERWRITE
     | MDB_NODUPDATA
     | MDB_CURRENT
-    | MDB_RESERVE
+    -- | MDB_RESERVE    -- (special handling)
     | MDB_APPEND
     | MDB_APPENDDUP
     | MDB_MULTIPLE
@@ -456,7 +457,7 @@ writeFlags =
     [(MDB_NOOVERWRITE, #const MDB_NOOVERWRITE)
     ,(MDB_NODUPDATA, #const MDB_NODUPDATA)
     ,(MDB_CURRENT, #const MDB_CURRENT)
-    ,(MDB_RESERVE, #const MDB_RESERVE)
+    -- ,(MDB_RESERVE, #const MDB_RESERVE)
     ,(MDB_APPEND, #const MDB_APPEND)
     ,(MDB_APPENDDUP, #const MDB_APPENDDUP)
     ,(MDB_MULTIPLE, #const MDB_MULTIPLE)
@@ -894,7 +895,7 @@ mdb_txn_renew txn =
 
 {-
 
--- I'm hoping to get a patch adding the following function into LMDB: 
+-- I'm hoping to get a patch adding the following function into the main LMDB: 
 -- foreign import ccall "lmdb.h mdb_txn_id" _mdb_txn_id :: MDB_txn -> IO MDB_txnid_t 
 
 -}
@@ -912,11 +913,17 @@ mdb_stat txn = mdb_stat_t txn . _dbi
 mdb_dbi_flags :: MDB_txn -> MDB_dbi -> IO [MDB_DbFlag]
 mdb_dbi_flags txn = mdb_dbi_flags_t txn . _dbi
 
--- | close the database
+-- | close the database handle.
+--
+-- Note: the normal use-case for LMDB is to open all the database
+-- handles up front, then hold onto them until the application is
+-- closed or crashed. In that case, you don't need to bother with
+-- closing database handles.
 mdb_dbi_close :: MDB_env -> MDB_dbi -> IO ()
 mdb_dbi_close env = mdb_dbi_close_t env . _dbi
 
--- | remove the database; don't use MDB_dbi after this
+-- | remove the database and close the handle; don't use MDB_dbi
+-- after this
 mdb_drop :: MDB_txn -> MDB_dbi -> IO ()
 mdb_drop txn = mdb_drop_t txn . _dbi
 
@@ -924,30 +931,21 @@ mdb_drop txn = mdb_drop_t txn . _dbi
 mdb_clear :: MDB_txn -> MDB_dbi -> IO ()
 mdb_clear txn = mdb_clear_t txn . _dbi
 
--- | Open a database that doesn't support user-defined comparisons,
--- and that uses 'unsafe' FFI calls for reading and writing to the
--- database for reduced overhead. Note that you can still use the
--- MDB_DbFlags to configure the comparison function.
 mdb_dbi_open' :: MDB_txn -> String -> [MDB_DbFlag] -> IO MDB_dbi'
 mdb_dbi_open' txn dbName flags = MDB_dbi' <$> mdb_dbi_open_t txn dbName flags
 
--- | database statistics
 mdb_stat' :: MDB_txn -> MDB_dbi' -> IO MDB_stat
 mdb_stat' txn = mdb_stat_t txn . _dbi'
 
--- | review flags from database
 mdb_dbi_flags' :: MDB_txn -> MDB_dbi' -> IO [MDB_DbFlag]
 mdb_dbi_flags' txn = mdb_dbi_flags_t txn . _dbi'
 
--- | close the database
 mdb_dbi_close' :: MDB_env -> MDB_dbi' -> IO ()
 mdb_dbi_close' txn = mdb_dbi_close_t txn . _dbi'
 
--- | remove the database; don't use MDB_dbi after this
 mdb_drop' :: MDB_txn -> MDB_dbi' -> IO ()
 mdb_drop' txn = mdb_drop_t txn . _dbi'
 
--- | clear contents from database, reset to empty
 mdb_clear' :: MDB_txn -> MDB_dbi' -> IO ()
 mdb_clear' txn = mdb_clear_t txn . _dbi'
 
@@ -978,7 +976,6 @@ mdb_dbi_flags_t txn dbi =
 mdb_dbi_close_t :: MDB_env -> MDB_dbi_t -> IO ()
 mdb_dbi_close_t env dbi = _mdb_dbi_close (_env_ptr env) dbi
 
-
 mdb_drop_t :: MDB_txn -> MDB_dbi_t -> IO ()
 mdb_drop_t txn dbi = 
     _mdb_drop (_txn_ptr txn) dbi 1 >>= \ rc ->
@@ -989,45 +986,213 @@ mdb_clear_t txn dbi =
     _mdb_drop (_txn_ptr txn) dbi 0 >>= \ rc ->
     unless (0 == rc) (_throwLMDBErrNum "mdb_clear" rc)
 
-{-
-
+-- | Set a user-defined key comparison function for a database.
 mdb_set_compare :: MDB_txn -> MDB_dbi -> FunPtr MDB_cmp_func -> IO ()
+mdb_set_compare txn dbi fcmp =
+    _mdb_set_compare (_txn_ptr txn) dbi fcmp >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_set_compare" rc)
+
+-- | Set a user-defined data comparison operator for MDB_DUPSORT databases.
 mdb_set_dupsort :: MDB_txn -> MDB_dbi -> FunPtr MDB_cmp_func -> IO ()
+mdb_set_dupsort txn dbi fcmp =
+    _mdb_set_dupsort (_txn_ptr txn) dbi fcmp >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_set_dupsort" rc)
 
--}
-
-{-
-
--- comparisons may only be configured for a 'safe' MDB_dbi.
-foreign import ccall "lmdb.h mdb_set_compare" _mdb_set_compare :: Ptr MDB_txn -> MDB_dbi -> FunPtr MDB_cmp_func -> IO CInt
-foreign import ccall "lmdb.h mdb_set_dupsort" _mdb_set_dupsort :: Ptr MDB_txn -> MDB_dbi -> FunPtr MDB_cmp_func -> IO CInt
-
--}
-
-{-
-
+-- | Access a value by key. Returns Nothing if the key is not found.
 mdb_get :: MDB_txn -> MDB_dbi -> MDB_val -> IO (Maybe MDB_val)
-mdb_put :: MDB_WriteFlags -> MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO MDB_val
+mdb_get txn dbi key =
+    allocaBytes (2 * sizeOf key) $ \ pKey ->
+    poke pKey key >>
+    let pData = pKey `plusPtr` (sizeOf key) in
+    _mdb_get (_txn_ptr txn) dbi pKey pData >>= \ rc ->
+    if (0 == rc) then Just <$> peek pData else
+    if ((#const MDB_NOTFOUND) == rc) then return Nothing else
+    _throwLMDBErrNum "mdb_get" rc
+
+-- | Add a (key,value) pair to the database.
+mdb_put :: MDB_WriteFlags -> MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO ()
+mdb_put wf txn dbi key val =
+    allocaBytes (2 * sizeOf key) $ \ pKey ->
+    let pVal = pKey `plusPtr` sizeOf key in
+    poke pKey key >> poke pVal val >>
+    _mdb_put (_txn_ptr txn) dbi pKey pVal wf >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_put" rc)
+
+-- | Allocate space for data under a given key. This space must be
+-- filled before the write transaction commits. The idea here is to
+-- avoid an extra allocation.
+--
+--     mdb_reserve flags txn dbi key byteCount
+--
+-- Note: not safe to use with MDB_DUPSORT. 
+mdb_reserve :: MDB_WriteFlags -> MDB_txn -> MDB_dbi -> MDB_val -> Int -> IO MDB_val
+mdb_reserve wf txn dbi key szBytes =
+    allocaBytes (2 * sizeOf key) $ \ pKey ->
+    let pVal = pKey `plusPtr` sizeOf key in
+    poke pKey key >> poke pVal (reserveData szBytes) >>
+    _mdb_put (_txn_ptr txn) dbi pKey pVal (wfReserve wf) >>= \ rc ->
+    if (0 == rc) then peek pVal else
+    _throwLMDBErrNum "mdb_reserve" rc
+
+wfReserve :: MDB_WriteFlags -> MDB_WriteFlags
+wfReserve (MDB_WriteFlags wf) = MDB_WriteFlags ((#const MDB_RESERVE) .|. wf)
+
+reserveData :: Int -> MDB_val
+reserveData szBytes = MDB_val (fromIntegral szBytes) nullPtr
+
+-- | Delete a given key, or a specific (key,value) pair in case of
+-- MDB_DUPSORT. This function will return False on a MDB_NOTFOUND
+-- result.
+--
+-- Note: Ideally, LMDB would match the value even without MDB_DUPSORT.
+-- But it doesn't. Under the hood, the data is replaced by a null ptr
+-- if MDB_DUPSORT is not enabled (v0.9.10).
 mdb_del :: MDB_txn -> MDB_dbi -> MDB_val -> Maybe MDB_val -> IO Bool
+mdb_del txn dbi key Nothing =
+    allocaBytes (sizeOf key) $ \ pKey ->
+    poke pKey key >>
+    _mdb_del (_txn_ptr txn) dbi pKey nullPtr >>= \ rc ->
+    r_del rc
+mdb_del txn dbi key (Just val) =
+    allocaBytes (2 * sizeOf key) $ \ pKey ->
+    let pVal = pKey `plusPtr` sizeOf key in
+    poke pKey key >> poke pVal val >>
+    _mdb_del (_txn_ptr txn) dbi pKey pVal >>= \ rc ->
+    r_del rc
+
+r_del :: CInt -> IO Bool
+r_del rc =
+    if (0 == rc) then return True else
+    if ((#const MDB_NOTFOUND) == rc) then return False else
+    _throwLMDBErrNum "mdb_del" rc
 
 mdb_get' :: MDB_txn -> MDB_dbi' -> MDB_val -> IO (Maybe MDB_val)
-mdb_put' :: MDB_WriteFlags -> MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO MDB_val
+mdb_get' txn dbi key =
+    allocaBytes (2 * sizeOf key) $ \ pKey ->
+    poke pKey key >>
+    let pData = pKey `plusPtr` (sizeOf key) in
+    _mdb_get' (_txn_ptr txn) dbi pKey pData >>= \ rc ->
+    if (0 == rc) then Just <$> peek pData else
+    if ((#const MDB_NOTFOUND) == rc) then return Nothing else
+    _throwLMDBErrNum "mdb_get" rc
+
+mdb_put' :: MDB_WriteFlags -> MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO ()
+mdb_put' wf txn dbi key val =
+    allocaBytes (2 * sizeOf key) $ \ pKey ->
+    let pVal = pKey `plusPtr` sizeOf key in
+    poke pKey key >> 
+    poke pVal val >>
+    _mdb_put' (_txn_ptr txn) dbi pKey pVal wf >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_put" rc)
+
+mdb_reserve' :: MDB_WriteFlags -> MDB_txn -> MDB_dbi' -> MDB_val -> Int -> IO MDB_val
+mdb_reserve' wf txn dbi key szBytes =
+    allocaBytes (2 * sizeOf key) $ \ pKey ->
+    let pVal = pKey `plusPtr` sizeOf key in
+    poke pKey key >> poke pVal (reserveData szBytes) >>
+    _mdb_put' (_txn_ptr txn) dbi pKey pVal (wfReserve wf) >>= \ rc ->
+    if (0 == rc) then peek pVal else
+    _throwLMDBErrNum "mdb_reserve" rc
+
 mdb_del' :: MDB_txn -> MDB_dbi' -> MDB_val -> Maybe MDB_val -> IO Bool
+mdb_del' txn dbi key Nothing =
+    allocaBytes (sizeOf key) $ \ pKey ->
+    poke pKey key >>
+    _mdb_del' (_txn_ptr txn) dbi pKey nullPtr >>= \ rc ->
+    r_del rc
+mdb_del' txn dbi key (Just val) =
+    allocaBytes (2 * sizeOf key) $ \ pKey ->
+    let pVal = pKey `plusPtr` sizeOf key in
+    poke pKey key >> poke pVal val >>
+    _mdb_del' (_txn_ptr txn) dbi pKey pVal >>= \rc ->
+    r_del rc
 
--}
+-- | compare two values as keys in a database
+mdb_cmp :: MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO Ordering
+mdb_cmp txn dbi a b =
+    allocaBytes (sizeOf a + sizeOf b) $ \ pA ->
+    let pB = pA `plusPtr` sizeOf a in
+    poke pA a >> poke pB b >>
+    _mdb_cmp (_txn_ptr txn) dbi pA pB >>= \ rc ->
+    return (compare rc 0)
 
+-- | compare two values as data in an MDB_DUPSORT database
+mdb_dcmp :: MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO Ordering
+mdb_dcmp txn dbi a b =
+    allocaBytes (sizeOf a + sizeOf b) $ \ pA ->
+    let pB = pA `plusPtr` sizeOf a in
+    poke pA a >> poke pB b >>
+    _mdb_dcmp (_txn_ptr txn) dbi pA pB >>= \ rc ->
+    return (compare rc 0)
+
+mdb_cmp' :: MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO Ordering
+mdb_cmp' txn dbi a b =
+    allocaBytes (sizeOf a + sizeOf b) $ \ pA ->
+    let pB = pA `plusPtr` sizeOf a in
+    poke pA a >> poke pB b >>
+    _mdb_cmp' (_txn_ptr txn) dbi pA pB >>= \ rc ->
+    return (compare rc 0)
+
+mdb_dcmp' :: MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO Ordering
+mdb_dcmp' txn dbi a b =
+    allocaBytes (sizeOf a + sizeOf b) $ \ pA ->
+    let pB = pA `plusPtr` sizeOf a in
+    poke pA a >> poke pB b >>
+    _mdb_dcmp' (_txn_ptr txn) dbi pA pB >>= \ rc ->
+    return (compare rc 0)
 
 {-
+-- | open a cursor for the database.
+mdb_cursor_open :: MDB_txn -> MDB_dbi -> IO MDB_cursor
+mdb_cursor_o
 
-foreign import ccall safe "lmdb.h mdb_get" _mdb_get :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
-foreign import ccall safe "lmdb.h mdb_put" _mdb_put :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
-foreign import ccall safe "lmdb.h mdb_del" _mdb_del :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+-- | close a cursor. don't use after this.
+mdb_cursor_close :: MDB_cursor -> IO ()
 
-foreign import ccall unsafe "lmdb.h mdb_get" _mdb_get' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_put" _mdb_put' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_del" _mdb_del' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+mdb_cursor_renew :: MDB_txn -> MDB_cursor -> IO ()
 
+
+foreign import ccall safe "lmdb.h mdb_cursor_open" _mdb_cursor_open :: Ptr MDB_txn -> MDB_dbi -> Ptr (Ptr MDB_cursor) -> IO CInt
+foreign import ccall safe "lmdb.h mdb_cursor_close" _mdb_cursor_close :: Ptr MDB_cursor -> IO ()
+foreign import ccall safe "lmdb.h mdb_cursor_renew" _mdb_cursor_renew :: Ptr MDB_txn -> Ptr MDB_cursor -> IO CInt
+foreign import ccall safe "lmdb.h mdb_cursor_get" _mdb_cursor_get :: Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> (#type MDB_cursor_op) -> IO CInt
+foreign import ccall safe "lmdb.h mdb_cursor_put" _mdb_cursor_put :: Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
+foreign import ccall safe "lmdb.h mdb_cursor_del" _mdb_cursor_del :: Ptr MDB_cursor -> MDB_WriteFlags -> IO CInt
+foreign import ccall safe "lmdb.h mdb_cursor_count" _mdb_cursor_count :: Ptr MDB_cursor -> Ptr CSize -> IO CInt
+foreign import ccall safe "lmdb.h mdb_cmp" _mdb_cmp :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+foreign import ccall safe "lmdb.h mdb_dcmp" _mdb_dcmp :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+-- foreign import ccall safe "lmdb.h mdb_cursor_txn" _mdb_cursor_txn :: Ptr MDB_cursor -> IO (Ptr MDB_txn)
+-- foreign import ccall safe "lmdb.h mdb_cursor_dbi" _mdb_cursor_dbi :: Ptr MDB_cursor -> IO MDB_dbi
 -}
+
+{-
+	MDB_FIRST,				/**< Position at first key/data item */
+	MDB_FIRST_DUP,			/**< Position at first data item of current key.
+								Only for #MDB_DUPSORT */
+	MDB_GET_BOTH,			/**< Position at key/data pair. Only for #MDB_DUPSORT */
+	MDB_GET_BOTH_RANGE,		/**< position at key, nearest data. Only for #MDB_DUPSORT */
+	MDB_GET_CURRENT,		/**< Return key/data at current cursor position */
+	MDB_GET_MULTIPLE,		/**< Return all the duplicate data items at the current
+								 cursor position. Only for #MDB_DUPFIXED */
+	MDB_LAST,				/**< Position at last key/data item */
+	MDB_LAST_DUP,			/**< Position at last data item of current key.
+								Only for #MDB_DUPSORT */
+	MDB_NEXT,				/**< Position at next data item */
+	MDB_NEXT_DUP,			/**< Position at next data item of current key.
+								Only for #MDB_DUPSORT */
+	MDB_NEXT_MULTIPLE,		/**< Return all duplicate data items at the next
+								cursor position. Only for #MDB_DUPFIXED */
+	MDB_NEXT_NODUP,			/**< Position at first data item of next key */
+	MDB_PREV,				/**< Position at previous data item */
+	MDB_PREV_DUP,			/**< Position at previous data item of current key.
+								Only for #MDB_DUPSORT */
+	MDB_PREV_NODUP,			/**< Position at last data item of previous key */
+	MDB_SET,				/**< Position at specified key */
+	MDB_SET_KEY,			/**< Position at specified key, return key + data */
+	MDB_SET_RANGE			/**< Position at first key greater than or equal to specified key. */
+-}
+-- mdb_cursor_get :: MDB_cursor -> 
+
 
 {-
 foreign import ccall safe "lmdb.h mdb_cursor_open" _mdb_cursor_open :: Ptr MDB_txn -> MDB_dbi -> Ptr (Ptr MDB_cursor) -> IO CInt
@@ -1056,17 +1221,6 @@ foreign import ccall unsafe "lmdb.h mdb_dcmp" _mdb_dcmp' :: Ptr MDB_txn -> MDB_d
 
 foreign import ccall "lmdb.h mdb_reader_list" _mdb_reader_list :: Ptr MDB_env -> FunPtr MDB_msg_func -> Ptr () -> IO CInt
 foreign import ccall "lmdb.h mdb_reader_check" _mdb_reader_check :: Ptr MDB_env -> Ptr CInt -> IO CInt
-
--- | User-defined comparison functions for keys. 
-type MDB_cmp_func = Ptr MDB_val -> Ptr MDB_val -> IO CInt
-foreign import ccall "wrapper"  wrapCmpFn :: MDB_cmp_func -> IO (FunPtr MDB_cmp_func)
-
--- callback function for reader list (used internally to this binding)
-type MDB_msg_func = CString -> Ptr () -> IO CInt
-foreign import ccall "wrapper" wrapMsgFunc :: MDB_msg_func -> IO (FunPtr MDB_msg_func)
-
-
-
 -}
 
 
