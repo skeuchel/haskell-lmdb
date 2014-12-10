@@ -28,17 +28,16 @@
 -- Features not implemented:
 --
 -- * functions directly using file handles 
--- * user-defined relocation functions (
---
+-- * user-defined relocation functions 
+-- 
 module Database.LMDB.Raw
     ( LMDB_Version(..), lmdb_version, lmdb_dyn_version
     , LMDB_Error(..), MDB_ErrCode(..)
 
     , MDB_env
-    , MDB_txn
-    , MDB_txnid
-    , MDB_cursor, MDB_cursor'
     , MDB_dbi, MDB_dbi'
+    , MDB_txn, MDB_txnid
+    , MDB_cursor, MDB_cursor'
 
     , MDB_val, mv_size, mv_data
     , MDB_stat, ms_psize, ms_depth, ms_branch_pages, ms_leaf_pages, ms_overflow_pages, ms_entries
@@ -46,7 +45,7 @@ module Database.LMDB.Raw
     , MDB_cmp_func, wrapCmpFn
     , MDB_EnvFlag(..), MDB_DbFlag(..)
     , MDB_WriteFlag(..), MDB_WriteFlags, compileWriteFlags
-    , MDB_cursor_op(..)
+    -- , MDB_cursor_op(..)
 
     -- | Environment Operations
     , mdb_env_create
@@ -72,6 +71,19 @@ module Database.LMDB.Raw
     , mdb_txn_abort
     , mdb_txn_reset
     , mdb_txn_renew
+
+    -- | Databases
+    , mdb_dbi_open
+    , mdb_stat
+    , mdb_dbi_flags
+    , mdb_dbi_close
+    , mdb_drop, mdb_clear
+
+    , mdb_dbi_open'
+    , mdb_stat'
+    , mdb_dbi_flags'
+    , mdb_dbi_close'
+    , mdb_drop', mdb_clear'
 
 {-
 
@@ -309,13 +321,12 @@ data MDB_cursor = MDB_cursor
 -- | Handle for a database in the environment.
 --
 -- This variation is associated with 'unsafe' FFI calls, with reduced
--- overhead at the cost of losing access to user-defined comparisons.
+-- overhead but no user-defined comparisons. I expect most code using
+-- LMDB could use this variation.
 newtype MDB_dbi' = MDB_dbi' { _dbi' :: MDB_dbi_t }
 
--- | Opaque structure for a cursor on an MDB_dbi' object. 
---
--- Again, this variation is associated with 'unsafe' FFI calls, with
--- reduced overhead but no user-defined comparisons.
+-- | Opaque structure for a cursor on an MDB_dbi' object. Cursors
+-- in this case also use the 'unsafe' FFI calls.
 data MDB_cursor' = MDB_cursor'
     { _crs_ptr' :: {-# UNPACK #-} !(Ptr MDB_cursor')
     , _crs_dbi' :: {-# UNPACK #-} !MDB_dbi'
@@ -777,7 +788,7 @@ mdb_env_get_maxkeysize env = fromIntegral <$> _mdb_env_get_maxkeysize (_env_ptr 
 -- only one child should be active at a time, all in the same OS thread.
 --
 -- An attempt to grab a writer transaction may block, potentially for a 
--- very long time. It's the responsibility of the software architect to
+-- very long time. It's the responsibility of the software architects to
 -- ensure there is no need for long-running write operations.
 --
 mdb_txn_begin :: MDB_env -> Maybe MDB_txn -> Bool -> IO MDB_txn
@@ -888,23 +899,137 @@ mdb_txn_renew txn =
 
 -}
 
+-- | Open a database that supports user-defined comparisons, but
+-- has slightly more FFI overhead for reads and writes.
+mdb_dbi_open :: MDB_txn -> String -> [MDB_DbFlag] -> IO MDB_dbi
+mdb_dbi_open txn dbName flags = MDB_dbi <$> mdb_dbi_open_t txn dbName flags
 
+-- | database statistics
+mdb_stat :: MDB_txn -> MDB_dbi -> IO MDB_stat
+mdb_stat txn = mdb_stat_t txn . _dbi
+
+-- | review flags from database
+mdb_dbi_flags :: MDB_txn -> MDB_dbi -> IO [MDB_DbFlag]
+mdb_dbi_flags txn = mdb_dbi_flags_t txn . _dbi
+
+-- | close the database
+mdb_dbi_close :: MDB_env -> MDB_dbi -> IO ()
+mdb_dbi_close env = mdb_dbi_close_t env . _dbi
+
+-- | remove the database; don't use MDB_dbi after this
+mdb_drop :: MDB_txn -> MDB_dbi -> IO ()
+mdb_drop txn = mdb_drop_t txn . _dbi
+
+-- | clear contents of database, reset to empty
+mdb_clear :: MDB_txn -> MDB_dbi -> IO ()
+mdb_clear txn = mdb_clear_t txn . _dbi
+
+-- | Open a database that doesn't support user-defined comparisons,
+-- and that uses 'unsafe' FFI calls for reading and writing to the
+-- database for reduced overhead. Note that you can still use the
+-- MDB_DbFlags to configure the comparison function.
+mdb_dbi_open' :: MDB_txn -> String -> [MDB_DbFlag] -> IO MDB_dbi'
+mdb_dbi_open' txn dbName flags = MDB_dbi' <$> mdb_dbi_open_t txn dbName flags
+
+-- | database statistics
+mdb_stat' :: MDB_txn -> MDB_dbi' -> IO MDB_stat
+mdb_stat' txn = mdb_stat_t txn . _dbi'
+
+-- | review flags from database
+mdb_dbi_flags' :: MDB_txn -> MDB_dbi' -> IO [MDB_DbFlag]
+mdb_dbi_flags' txn = mdb_dbi_flags_t txn . _dbi'
+
+-- | close the database
+mdb_dbi_close' :: MDB_env -> MDB_dbi' -> IO ()
+mdb_dbi_close' txn = mdb_dbi_close_t txn . _dbi'
+
+-- | remove the database; don't use MDB_dbi after this
+mdb_drop' :: MDB_txn -> MDB_dbi' -> IO ()
+mdb_drop' txn = mdb_drop_t txn . _dbi'
+
+-- | clear contents from database, reset to empty
+mdb_clear' :: MDB_txn -> MDB_dbi' -> IO ()
+mdb_clear' txn = mdb_clear_t txn . _dbi'
+
+
+mdb_dbi_open_t :: MDB_txn -> String -> [MDB_DbFlag] -> IO MDB_dbi_t
+mdb_dbi_open_t txn dbName flags =
+    let cdbFlags = compileDBFlags flags in
+    withCString dbName $ \ cdbName ->
+    alloca $ \ pDBI ->
+    _mdb_dbi_open (_txn_ptr txn) cdbName cdbFlags pDBI >>= \ rc ->
+    if (0 == rc) then peek pDBI else
+    _throwLMDBErrNum "mdb_dbi_open" rc
+
+mdb_stat_t :: MDB_txn -> MDB_dbi_t -> IO MDB_stat
+mdb_stat_t txn dbi = 
+    alloca $ \ pStat ->
+    _mdb_stat (_txn_ptr txn) dbi pStat >>= \ rc ->
+    if (0 == rc) then peek pStat else
+    _throwLMDBErrNum "mdb_stat" rc
+
+mdb_dbi_flags_t :: MDB_txn -> MDB_dbi_t -> IO [MDB_DbFlag] 
+mdb_dbi_flags_t txn dbi =
+    alloca $ \ pFlags ->
+    _mdb_dbi_flags (_txn_ptr txn) dbi pFlags >>= \ rc ->
+    if (0 == rc) then decompileDBFlags <$> peek pFlags else
+    _throwLMDBErrNum "mdb_dbi_flags" rc
+
+mdb_dbi_close_t :: MDB_env -> MDB_dbi_t -> IO ()
+mdb_dbi_close_t env dbi = _mdb_dbi_close (_env_ptr env) dbi
+
+
+mdb_drop_t :: MDB_txn -> MDB_dbi_t -> IO ()
+mdb_drop_t txn dbi = 
+    _mdb_drop (_txn_ptr txn) dbi 1 >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_drop" rc)
+
+mdb_clear_t :: MDB_txn -> MDB_dbi_t -> IO ()
+mdb_clear_t txn dbi =
+    _mdb_drop (_txn_ptr txn) dbi 0 >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_clear" rc)
 
 {-
 
-foreign import ccall "lmdb.h mdb_dbi_open" _mdb_dbi_open :: Ptr MDB_txn -> CString -> CUInt -> Ptr MDB_dbi_t -> IO CInt
-foreign import ccall "lmdb.h mdb_stat" _mdb_stat :: Ptr MDB_txn -> MDB_dbi_t -> Ptr MDB_stat -> IO CInt
-foreign import ccall "lmdb.h mdb_dbi_flags" _mdb_dbi_flags :: Ptr MDB_txn -> MDB_dbi_t -> Ptr CUInt -> IO CInt
-foreign import ccall "lmdb.h mdb_dbi_close" _mdb_dbi_close :: Ptr MDB_env -> MDB_dbi_t -> IO ()
-foreign import ccall "lmdb.h mdb_drop" _mdb_drop :: Ptr MDB_txn -> MDB_dbi_t -> CInt -> IO CInt
+mdb_set_compare :: MDB_txn -> MDB_dbi -> FunPtr MDB_cmp_func -> IO ()
+mdb_set_dupsort :: MDB_txn -> MDB_dbi -> FunPtr MDB_cmp_func -> IO ()
+
+-}
+
+{-
 
 -- comparisons may only be configured for a 'safe' MDB_dbi.
 foreign import ccall "lmdb.h mdb_set_compare" _mdb_set_compare :: Ptr MDB_txn -> MDB_dbi -> FunPtr MDB_cmp_func -> IO CInt
 foreign import ccall "lmdb.h mdb_set_dupsort" _mdb_set_dupsort :: Ptr MDB_txn -> MDB_dbi -> FunPtr MDB_cmp_func -> IO CInt
 
+-}
+
+{-
+
+mdb_get :: MDB_txn -> MDB_dbi -> MDB_val -> IO (Maybe MDB_val)
+mdb_put :: MDB_WriteFlags -> MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO MDB_val
+mdb_del :: MDB_txn -> MDB_dbi -> MDB_val -> Maybe MDB_val -> IO Bool
+
+mdb_get' :: MDB_txn -> MDB_dbi' -> MDB_val -> IO (Maybe MDB_val)
+mdb_put' :: MDB_WriteFlags -> MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO MDB_val
+mdb_del' :: MDB_txn -> MDB_dbi' -> MDB_val -> Maybe MDB_val -> IO Bool
+
+-}
+
+
+{-
+
 foreign import ccall safe "lmdb.h mdb_get" _mdb_get :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
 foreign import ccall safe "lmdb.h mdb_put" _mdb_put :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
 foreign import ccall safe "lmdb.h mdb_del" _mdb_del :: Ptr MDB_txn -> MDB_dbi -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+
+foreign import ccall unsafe "lmdb.h mdb_get" _mdb_get' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+foreign import ccall unsafe "lmdb.h mdb_put" _mdb_put' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
+foreign import ccall unsafe "lmdb.h mdb_del" _mdb_del' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+
+-}
+
+{-
 foreign import ccall safe "lmdb.h mdb_cursor_open" _mdb_cursor_open :: Ptr MDB_txn -> MDB_dbi -> Ptr (Ptr MDB_cursor) -> IO CInt
 foreign import ccall safe "lmdb.h mdb_cursor_close" _mdb_cursor_close :: Ptr MDB_cursor -> IO ()
 foreign import ccall safe "lmdb.h mdb_cursor_renew" _mdb_cursor_renew :: Ptr MDB_txn -> Ptr MDB_cursor -> IO CInt
@@ -917,9 +1042,6 @@ foreign import ccall safe "lmdb.h mdb_dcmp" _mdb_dcmp :: Ptr MDB_txn -> MDB_dbi 
 -- foreign import ccall safe "lmdb.h mdb_cursor_txn" _mdb_cursor_txn :: Ptr MDB_cursor -> IO (Ptr MDB_txn)
 -- foreign import ccall safe "lmdb.h mdb_cursor_dbi" _mdb_cursor_dbi :: Ptr MDB_cursor -> IO MDB_dbi
 
-foreign import ccall unsafe "lmdb.h mdb_get" _mdb_get' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_put" _mdb_put' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
-foreign import ccall unsafe "lmdb.h mdb_del" _mdb_del' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
 foreign import ccall unsafe "lmdb.h mdb_cursor_open" _mdb_cursor_open' :: Ptr MDB_txn -> MDB_dbi' -> Ptr (Ptr MDB_cursor') -> IO CInt
 foreign import ccall unsafe "lmdb.h mdb_cursor_close" _mdb_cursor_close' :: Ptr MDB_cursor' -> IO ()
 foreign import ccall unsafe "lmdb.h mdb_cursor_renew" _mdb_cursor_renew' :: Ptr MDB_txn -> Ptr MDB_cursor' -> IO CInt
