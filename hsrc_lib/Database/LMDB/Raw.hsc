@@ -33,9 +33,7 @@
 -- * functions directly using file handles 
 -- * user-defined relocation functions 
 -- * alloc-avoiding renew and reset operations
---
 -- * MDB_MULTIPLE is not currently supported (todo)
--- * cursor write (put,del) not currently supported (todo)
 -- 
 module Database.LMDB.Raw
     ( LMDB_Version(..), lmdb_version, lmdb_dyn_version
@@ -50,8 +48,8 @@ module Database.LMDB.Raw
     , MDB_stat, ms_psize, ms_depth, ms_branch_pages, ms_leaf_pages, ms_overflow_pages, ms_entries
     , MDB_envinfo, me_mapaddr, me_mapsize, me_last_pgno, me_last_txnid, me_maxreaders, me_numreaders
     , MDB_cmp_func, wrapCmpFn
-    , MDB_EnvFlag(..)
-    , MDB_DbFlag(..)
+    , MDB_EnvFlag(..), MDB_DbFlag(..)
+    , MDB_cursor_op(..)
 
     , MDB_WriteFlag(..), MDB_WriteFlags, compileWriteFlags
     --, MDB_cursor_op(..)
@@ -102,22 +100,24 @@ module Database.LMDB.Raw
     , mdb_cmp, mdb_dcmp
     , mdb_cmp', mdb_dcmp'
 
-    -- | Cursor Meta
+    -- | Cursors
     , mdb_cursor_open
+    , mdb_cursor_get
+    , mdb_cursor_put
+    , mdb_cursor_del
     , mdb_cursor_close
     , mdb_cursor_txn
     , mdb_cursor_dbi
     , mdb_cursor_count
 
     , mdb_cursor_open'
+    , mdb_cursor_get'
+    , mdb_cursor_put'
+    , mdb_cursor_del'
     , mdb_cursor_close'
     , mdb_cursor_txn'
     , mdb_cursor_dbi'
     , mdb_cursor_count'
-
-    -- | Cursor Access
-    --, mdb_cursor_get
-    --, mdb_cursor_get'
 
     -- | Misc
     , mdb_reader_list
@@ -378,7 +378,7 @@ data MDB_EnvFlag
     | MDB_NOMETASYNC
     | MDB_WRITEMAP
     | MDB_MAPASYNC
-    -- | MDB_NOTLS
+    --  | MDB_NOTLS
     | MDB_NOLOCK
     | MDB_NORDAHEAD
     | MDB_NOMEMINIT
@@ -446,18 +446,19 @@ decompileDBFlags = decompileBitFlags dbFlags . fromIntegral
 data MDB_WriteFlag 
     = MDB_NOOVERWRITE
     | MDB_NODUPDATA
-    -- | MDB_CURRENT  -- (cursor writes not supported for now)
-    -- | MDB_RESERVE  -- (needs dedicated function)
+    | MDB_CURRENT  -- (cursor writes not supported for now)
+    --  | MDB_RESERVE  -- (needs dedicated function)
     | MDB_APPEND     -- separate function
     | MDB_APPENDDUP  -- separate function
-    -- | MDB_MULTIPLE -- (needs special handling)
+    --  | MDB_MULTIPLE -- (needs special handling)
     deriving (Eq, Ord, Bounded, A.Ix, Show)
+
 
 writeFlags :: [(MDB_WriteFlag, Int)]
 writeFlags =
     [(MDB_NOOVERWRITE, #const MDB_NOOVERWRITE)
     ,(MDB_NODUPDATA, #const MDB_NODUPDATA)
-    -- ,(MDB_CURRENT, #const MDB_CURRENT)
+    ,(MDB_CURRENT, #const MDB_CURRENT)
     -- ,(MDB_RESERVE, #const MDB_RESERVE)
     ,(MDB_APPEND, #const MDB_APPEND)
     ,(MDB_APPENDDUP, #const MDB_APPENDDUP)
@@ -477,7 +478,6 @@ compileWriteFlags :: [MDB_WriteFlag] -> MDB_WriteFlags
 compileWriteFlags = MDB_WriteFlags . L.foldl' addWF 0 where
     addWF n wf = n .|. fromIntegral (writeFlagsArray A.! wf)
 
-{-
 data MDB_cursor_op
     = MDB_FIRST
     | MDB_FIRST_DUP
@@ -524,9 +524,8 @@ cursorOps =
 cursorOpsArray :: A.UArray MDB_cursor_op Int 
 cursorOpsArray = A.accumArray (flip const) minBound (minBound,maxBound) cursorOps
 
-vCursorOp :: MDB_cursor_op -> (#type MDB_cursor_op)
-vCursorOp = fromIntegral . (A.!) cursorOpsArray
--}
+cursorOp :: MDB_cursor_op -> (#type MDB_cursor_op)
+cursorOp = fromIntegral . (A.!) cursorOpsArray
 
 -- | Error codes from MDB. Note, however, that this API for MDB will mostly
 -- use exceptions for any non-successful return codes. This is mostly included
@@ -1010,16 +1009,33 @@ mdb_set_dupsort txn dbi fcmp =
     _mdb_set_dupsort (_txn_ptr txn) dbi fcmp >>= \ rc ->
     unless (0 == rc) (_throwLMDBErrNum "mdb_set_dupsort" rc)
 
+-- zero datum
+zed :: MDB_val
+zed = MDB_val 0 nullPtr
+
 -- | Access a value by key. Returns Nothing if the key is not found.
 mdb_get :: MDB_txn -> MDB_dbi -> MDB_val -> IO (Maybe MDB_val)
 mdb_get txn dbi key =
-    allocaBytes (2 * sizeOf key) $ \ pKey ->
-    poke pKey key >>
-    let pData = pKey `plusPtr` (sizeOf key) in
-    _mdb_get (_txn_ptr txn) dbi pKey pData >>= \ rc ->
-    if (0 == rc) then Just <$> peek pData else
+    withKVPtrs key zed $ \ pKey pVal ->
+    _mdb_get (_txn_ptr txn) dbi pKey pVal >>= \ rc ->
+    r_get rc pVal
+{-# INLINE mdb_get #-}
+
+r_get :: CInt -> Ptr MDB_val -> IO (Maybe MDB_val)
+r_get rc pVal =
+    if (0 == rc) then Just <$> peek pVal else
     if ((#const MDB_NOTFOUND) == rc) then return Nothing else
     _throwLMDBErrNum "mdb_get" rc
+{-# INLINE r_get #-}
+
+withKVPtrs :: MDB_val -> MDB_val -> (Ptr MDB_val -> Ptr MDB_val -> IO a) -> IO a
+withKVPtrs k v fn =
+    allocaBytes (2 * sizeOf k) $ \ pK ->
+    let pV = pK `plusPtr` sizeOf k in
+    do poke pK k
+       poke pV v
+       fn pK pV
+{-# INLINE withKVPtrs #-}
 
 -- | Add a (key,value) pair to the database.
 --
@@ -1027,17 +1043,17 @@ mdb_get txn dbi key =
 -- return value results in an exception. 
 mdb_put :: MDB_WriteFlags -> MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO Bool
 mdb_put wf txn dbi key val =
-    allocaBytes (2 * sizeOf key) $ \ pKey ->
-    let pVal = pKey `plusPtr` sizeOf key in
-    poke pKey key >> poke pVal val >>
+    withKVPtrs key val $ \ pKey pVal ->
     _mdb_put (_txn_ptr txn) dbi pKey pVal wf >>= \ rc ->
     r_put rc
+{-# INLINE mdb_put #-}
 
 r_put :: CInt -> IO Bool
 r_put rc =
     if (0 == rc) then return True else
     if ((#const MDB_KEYEXIST) == rc) then return False else
     _throwLMDBErrNum "mdb_put" rc
+{-# INLINE r_put #-}
 
 -- | Allocate space for data under a given key. This space must be
 -- filled before the write transaction commits. The idea here is to
@@ -1049,12 +1065,11 @@ r_put rc =
 -- Note: MDB_KEYEXIST will result in an exception here.
 mdb_reserve :: MDB_WriteFlags -> MDB_txn -> MDB_dbi -> MDB_val -> Int -> IO MDB_val
 mdb_reserve wf txn dbi key szBytes =
-    allocaBytes (2 * sizeOf key) $ \ pKey ->
-    let pVal = pKey `plusPtr` sizeOf key in
-    poke pKey key >> poke pVal (reserveData szBytes) >>
+    withKVPtrs key (reserveData szBytes) $ \ pKey pVal ->
     _mdb_put (_txn_ptr txn) dbi pKey pVal (wfReserve wf) >>= \ rc ->
     if (0 == rc) then peek pVal else
     _throwLMDBErrNum "mdb_reserve" rc
+{-# INLINE mdb_reserve #-}
 
 wfReserve :: MDB_WriteFlags -> MDB_WriteFlags
 wfReserve (MDB_WriteFlags wf) = MDB_WriteFlags ((#const MDB_RESERVE) .|. wf)
@@ -1071,14 +1086,12 @@ reserveData szBytes = MDB_val (fromIntegral szBytes) nullPtr
 -- if MDB_DUPSORT is not enabled (v0.9.10).
 mdb_del :: MDB_txn -> MDB_dbi -> MDB_val -> Maybe MDB_val -> IO Bool
 mdb_del txn dbi key Nothing =
-    allocaBytes (sizeOf key) $ \ pKey ->
+    alloca $ \ pKey ->
     poke pKey key >>
     _mdb_del (_txn_ptr txn) dbi pKey nullPtr >>= \ rc ->
     r_del rc
 mdb_del txn dbi key (Just val) =
-    allocaBytes (2 * sizeOf key) $ \ pKey ->
-    let pVal = pKey `plusPtr` sizeOf key in
-    poke pKey key >> poke pVal val >>
+    withKVPtrs key val $ \ pKey pVal ->
     _mdb_del (_txn_ptr txn) dbi pKey pVal >>= \ rc ->
     r_del rc
 
@@ -1087,78 +1100,64 @@ r_del rc =
     if (0 == rc) then return True else
     if ((#const MDB_NOTFOUND) == rc) then return False else
     _throwLMDBErrNum "mdb_del" rc
+{-# INLINE r_del #-}
 
 mdb_get' :: MDB_txn -> MDB_dbi' -> MDB_val -> IO (Maybe MDB_val)
 mdb_get' txn dbi key =
-    allocaBytes (2 * sizeOf key) $ \ pKey ->
-    poke pKey key >>
-    let pData = pKey `plusPtr` (sizeOf key) in
-    _mdb_get' (_txn_ptr txn) dbi pKey pData >>= \ rc ->
-    if (0 == rc) then Just <$> peek pData else
-    if ((#const MDB_NOTFOUND) == rc) then return Nothing else
-    _throwLMDBErrNum "mdb_get" rc
+    withKVPtrs key zed $ \ pKey pVal ->
+    _mdb_get' (_txn_ptr txn) dbi pKey pVal >>= \ rc ->
+    r_get rc pVal
+{-# INLINE mdb_get' #-}
 
 mdb_put' :: MDB_WriteFlags -> MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO Bool
 mdb_put' wf txn dbi key val =
-    allocaBytes (2 * sizeOf key) $ \ pKey ->
-    let pVal = pKey `plusPtr` sizeOf key in
-    poke pKey key >> poke pVal val >>
+    withKVPtrs key val $ \ pKey pVal ->
     _mdb_put' (_txn_ptr txn) dbi pKey pVal wf >>= \ rc ->
     r_put rc
+{-# INLINE mdb_put' #-}
 
 mdb_reserve' :: MDB_WriteFlags -> MDB_txn -> MDB_dbi' -> MDB_val -> Int -> IO MDB_val
 mdb_reserve' wf txn dbi key szBytes =
-    allocaBytes (2 * sizeOf key) $ \ pKey ->
-    let pVal = pKey `plusPtr` sizeOf key in
-    poke pKey key >> poke pVal (reserveData szBytes) >>
+    withKVPtrs key (reserveData szBytes) $ \ pKey pVal ->
     _mdb_put' (_txn_ptr txn) dbi pKey pVal (wfReserve wf) >>= \ rc ->
     if (0 == rc) then peek pVal else
     _throwLMDBErrNum "mdb_reserve" rc
+{-# INLINE mdb_reserve' #-}
 
 mdb_del' :: MDB_txn -> MDB_dbi' -> MDB_val -> Maybe MDB_val -> IO Bool
 mdb_del' txn dbi key Nothing =
-    allocaBytes (sizeOf key) $ \ pKey ->
+    alloca $ \ pKey ->
     poke pKey key >>
     _mdb_del' (_txn_ptr txn) dbi pKey nullPtr >>= \ rc ->
     r_del rc
 mdb_del' txn dbi key (Just val) =
-    allocaBytes (2 * sizeOf key) $ \ pKey ->
-    let pVal = pKey `plusPtr` sizeOf key in
-    poke pKey key >> poke pVal val >>
+    withKVPtrs key val $ \ pKey pVal ->
     _mdb_del' (_txn_ptr txn) dbi pKey pVal >>= \rc ->
     r_del rc
 
 -- | compare two values as keys in a database
 mdb_cmp :: MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO Ordering
 mdb_cmp txn dbi a b =
-    allocaBytes (sizeOf a + sizeOf b) $ \ pA ->
-    let pB = pA `plusPtr` sizeOf a in
-    poke pA a >> poke pB b >>
+    withKVPtrs a b $ \ pA pB ->
     _mdb_cmp (_txn_ptr txn) dbi pA pB >>= \ rc ->
     return (compare rc 0)
 
 -- | compare two values as data in an MDB_DUPSORT database
 mdb_dcmp :: MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO Ordering
 mdb_dcmp txn dbi a b =
-    allocaBytes (sizeOf a + sizeOf b) $ \ pA ->
-    let pB = pA `plusPtr` sizeOf a in
-    poke pA a >> poke pB b >>
+    withKVPtrs a b $ \ pA pB ->
     _mdb_dcmp (_txn_ptr txn) dbi pA pB >>= \ rc ->
     return (compare rc 0)
 
 mdb_cmp' :: MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO Ordering
 mdb_cmp' txn dbi a b =
-    allocaBytes (sizeOf a + sizeOf b) $ \ pA ->
-    let pB = pA `plusPtr` sizeOf a in
-    poke pA a >> poke pB b >>
+    withKVPtrs a b $ \ pA pB ->
     _mdb_cmp' (_txn_ptr txn) dbi pA pB >>= \ rc ->
     return (compare rc 0)
 
 mdb_dcmp' :: MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO Ordering
 mdb_dcmp' txn dbi a b =
-    allocaBytes (sizeOf a + sizeOf b) $ \ pA ->
-    let pB = pA `plusPtr` sizeOf a in
-    poke pA a >> poke pB b >>
+    withKVPtrs a b $ \ pA pB ->
     _mdb_dcmp' (_txn_ptr txn) dbi pA pB >>= \ rc ->
     return (compare rc 0)
 
@@ -1186,6 +1185,67 @@ mdb_cursor_open' txn dbi =
         , _crs_dbi' = dbi
         , _crs_txn' = txn
         }
+
+-- | Low-level mdb_cursor_get operation, with direct control of how
+-- pointers to values are allocated, whether an argument is a nullPtr,
+-- and so on.
+--
+-- In this case, False is returned for MDB_NOTFOUND (in which case the
+-- cursor should not be moved), and True is returned for MDB_SUCCESS.
+-- Depending on the MDB_cursor_op, additional values may be returned
+-- via the pointers. 
+mdb_cursor_get :: MDB_cursor_op -> MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> IO Bool
+mdb_cursor_get op crs pKey pData = _mdb_cursor_get (_crs_ptr crs) pKey pData (cursorOp op) >>= r_cursor_get
+{-# INLINE mdb_cursor_get #-}
+
+r_cursor_get :: CInt -> IO Bool
+r_cursor_get rc =
+    if(0 == rc) then return True else
+    if((#const MDB_NOTFOUND) == rc) then return False else
+    _throwLMDBErrNum "mdb_cursor_get" rc
+{-# INLINE r_cursor_get #-}
+
+mdb_cursor_get' :: MDB_cursor_op -> MDB_cursor' -> Ptr MDB_val -> Ptr MDB_val -> IO Bool
+mdb_cursor_get' op crs pKey pData = _mdb_cursor_get' (_crs_ptr' crs) pKey pData (cursorOp op) >>= r_cursor_get
+{-# INLINE mdb_cursor_get' #-}
+
+-- | Low-level 'mdb_cursor_put' operation.
+--
+-- As with mdb_put, this returns True on MDB_SUCCESS and False for MDB_KEYEXIST,
+-- and otherwise throws an exception.
+mdb_cursor_put :: MDB_WriteFlags -> MDB_cursor -> MDB_val -> MDB_val -> IO Bool
+mdb_cursor_put wf crs key val =
+    withKVPtrs key val $ \ pKey pVal -> 
+    _mdb_cursor_put (_crs_ptr crs) pKey pVal wf >>= \ rc ->
+    r_cursor_put rc
+{-# INLINE mdb_cursor_put #-}
+
+r_cursor_put :: CInt -> IO Bool
+r_cursor_put rc =
+    if(0 == rc) then return True else
+    if((#const MDB_KEYEXIST) == rc) then return False else
+    _throwLMDBErrNum "mdb_cursor_put" rc
+{-# INLINE r_cursor_put #-}
+
+mdb_cursor_put' :: MDB_WriteFlags -> MDB_cursor' -> MDB_val -> MDB_val -> IO Bool
+mdb_cursor_put' wf crs key val =
+    withKVPtrs key val $ \ pKey pVal ->
+    _mdb_cursor_put' (_crs_ptr' crs) pKey pVal wf >>= \ rc ->
+    r_cursor_put rc
+{-# INLINE mdb_cursor_put' #-}
+
+-- | Delete the value at the cursor. 
+mdb_cursor_del :: MDB_WriteFlags -> MDB_cursor -> IO ()
+mdb_cursor_del wf crs = _mdb_cursor_del (_crs_ptr crs) wf >>= r_cursor_del
+{-# INLINE mdb_cursor_del #-}
+
+r_cursor_del :: CInt -> IO ()
+r_cursor_del rc = unless (0 == rc) (_throwLMDBErrNum "mdb_cursor_del" rc)
+{-# INLINE r_cursor_del #-}
+
+mdb_cursor_del' :: MDB_WriteFlags -> MDB_cursor' -> IO ()
+mdb_cursor_del' wf crs = _mdb_cursor_del' (_crs_ptr' crs) wf >>= r_cursor_del
+{-# INLINE mdb_cursor_del' #-}
 
 -- | Close a cursor. don't use after this. In general, cursors should 
 -- be closed before their associated transaction is commited or aborted.
@@ -1264,22 +1324,6 @@ valToBytes (MDB_val sz pd) = do
     return $! B.fromForeignPtr fpd 0 (fromIntegral sz)
     
 -}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 instance Storable MDB_val where
