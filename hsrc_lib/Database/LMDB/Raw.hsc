@@ -346,8 +346,8 @@ type MDB_txnid_t = CSize -- typedef not currently exposed
 
 -- | A value stored in the database. Be cautious; committing the
 -- transaction that obtained a value should also invalidate it;
--- avoid capturing MDB_val in a lazy value. A 'safe' interface
--- similar to STRef will be provided in another module.
+-- avoid capturing MDB_val in a lazy value. A safe interface
+-- similar to STRef could be provided by another module.
 data MDB_val = MDB_val
     { mv_size :: {-# UNPACK #-} !CSize
     , mv_data :: {-# UNPACK #-} !(Ptr Word8)
