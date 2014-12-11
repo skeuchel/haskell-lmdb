@@ -122,6 +122,10 @@ module Database.LMDB.Raw
     -- | Misc
     , mdb_reader_list
     , mdb_reader_check
+
+    -- | Utility
+    , withKVPtrs
+    , withKVOptPtrs
     ) where
 
 #include <lmdb.h>
@@ -194,7 +198,8 @@ foreign import ccall unsafe "lmdb.h mdb_get" _mdb_get' :: Ptr MDB_txn -> MDB_dbi
 foreign import ccall unsafe "lmdb.h mdb_put" _mdb_put' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> MDB_WriteFlags -> IO CInt
 foreign import ccall unsafe "lmdb.h mdb_del" _mdb_del' :: Ptr MDB_txn -> MDB_dbi' -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
 
--- I really hate LMDB's cursor interface: one function with 18 special cases.
+-- I dislike LMDB's cursor interface: one 'get' function with 18 special cases. 
+-- Seems like it should be 18 functions.
 foreign import ccall safe "lmdb.h mdb_cursor_open" _mdb_cursor_open :: Ptr MDB_txn -> MDB_dbi -> Ptr (Ptr MDB_cursor) -> IO CInt
 foreign import ccall safe "lmdb.h mdb_cursor_close" _mdb_cursor_close :: Ptr MDB_cursor -> IO ()
 foreign import ccall safe "lmdb.h mdb_cursor_get" _mdb_cursor_get :: Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> (#type MDB_cursor_op) -> IO CInt
@@ -446,10 +451,10 @@ decompileDBFlags = decompileBitFlags dbFlags . fromIntegral
 data MDB_WriteFlag 
     = MDB_NOOVERWRITE
     | MDB_NODUPDATA
-    | MDB_CURRENT  -- (cursor writes not supported for now)
+    | MDB_CURRENT  
     --  | MDB_RESERVE  -- (needs dedicated function)
-    | MDB_APPEND     -- separate function
-    | MDB_APPENDDUP  -- separate function
+    | MDB_APPEND   
+    | MDB_APPENDDUP
     --  | MDB_MULTIPLE -- (needs special handling)
     deriving (Eq, Ord, Bounded, A.Ix, Show)
 
@@ -591,7 +596,7 @@ _throwLMDBErrNum context errNum = do
         , e_description = desc
         , e_code = _numToErrVal (fromIntegral errNum)
         }
-
+{-# NOINLINE _throwLMDBErrNum #-}
 
 -- | Allocate an environment object. This doesn't open the environment.
 --
@@ -601,14 +606,17 @@ _throwLMDBErrNum context errNum = do
 --   mdb_env_set_maxreaders
 --   mdb_env_set_maxdbs
 --
--- Then, just after opening, you should create all the databases your
--- application will use.
+-- Then, just after opening, you should create a transaction to open
+-- all the databases (MDB_dbi and MDB_dbi' values) your application 
+-- will use. 
+--
+-- The typical use case would then involve keeping all these open 
+-- until your application either shuts down or crashes.
 -- 
 -- In addition to normal LMDB errors, this operation may throw an
--- MDB_VERSION_MISMATCH if the Haskell LMDB bindings doesn't match
+-- MDB_VERSION_MISMATCH if the Haskell LMDB bindings don't match
 -- the dynamic version. If this happens, you'll need to rebuild the
--- lmdb Haskell package, and ensure your lmdb-dev libraries are up
--- to date. 
+-- lmdb Haskell package.
 mdb_env_create :: IO MDB_env
 mdb_env_create = alloca $ \ ppEnv -> 
     lmdb_validate_version_match >>
@@ -629,6 +637,9 @@ lmdb_validate_version_match =
             , e_code = Right MDB_VERSION_MISMATCH
             }
 
+-- this match function is a bit relaxed, e.g. it will accept
+-- LMDB 0.9.10 with 0.9.8, so long as the first two numbers
+-- match. 
 versionMatch :: LMDB_Version -> LMDB_Version -> Bool
 versionMatch vA vB = matchMajor && matchMinor where
     matchMajor = ((==) `on` v_major) vA vB
@@ -964,18 +975,16 @@ mdb_drop' txn = mdb_drop_t txn . _dbi'
 mdb_clear' :: MDB_txn -> MDB_dbi' -> IO ()
 mdb_clear' txn = mdb_clear_t txn . _dbi'
 
+-- | use a nullable CString
+withCStringMaybe :: Maybe String -> (CString -> IO a) -> IO a
+withCStringMaybe Nothing f = f nullPtr
+withCStringMaybe (Just s) f = withCString s f
 
 mdb_dbi_open_t :: MDB_txn -> Maybe String -> [MDB_DbFlag] -> IO MDB_dbi_t
-mdb_dbi_open_t txn Nothing flags = -- use nullPtr for name
+mdb_dbi_open_t txn dbName flags = -- use string name
     let cdbFlags = compileDBFlags flags in
     alloca $ \ pDBI ->
-    _mdb_dbi_open (_txn_ptr txn) nullPtr cdbFlags pDBI >>= \ rc ->
-    if (0 == rc) then peek pDBI else
-    _throwLMDBErrNum "mdb_dbi_open" rc
-mdb_dbi_open_t txn (Just dbName) flags = -- use string name
-    let cdbFlags = compileDBFlags flags in
-    withCString dbName $ \ cdbName ->
-    alloca $ \ pDBI ->
+    withCStringMaybe dbName $ \ cdbName ->
     _mdb_dbi_open (_txn_ptr txn) cdbName cdbFlags pDBI >>= \ rc ->
     if (0 == rc) then peek pDBI else
     _throwLMDBErrNum "mdb_dbi_open" rc
@@ -1038,6 +1047,7 @@ r_get rc pVal =
     _throwLMDBErrNum "mdb_get" rc
 {-# INLINE r_get #-}
 
+-- | utility function: prepare pointers suitable for mdb_cursor_get.
 withKVPtrs :: MDB_val -> MDB_val -> (Ptr MDB_val -> Ptr MDB_val -> IO a) -> IO a
 withKVPtrs k v fn =
     allocaBytes (2 * sizeOf k) $ \ pK ->
@@ -1047,10 +1057,17 @@ withKVPtrs k v fn =
        fn pK pV
 {-# INLINE withKVPtrs #-}
 
+-- | variation on withKVPtrs with nullable value.
+withKVOptPtrs :: MDB_val -> Maybe MDB_val -> (Ptr MDB_val -> Ptr MDB_val -> IO a) -> IO a
+withKVOptPtrs k (Just v) fn = withKVPtrs k v fn
+withKVOptPtrs k Nothing fn = alloca $ \ pK -> poke pK k >> fn pK nullPtr
+
+
 -- | Add a (key,value) pair to the database.
 --
 -- Returns False on MDB_KEYEXIST, and True on MDB_SUCCESS. Any other
--- return value results in an exception. 
+-- return value from LMDB results in an exception. The MDB_KEYEXIST
+-- result can be returned only if certain write flags are enabled.
 mdb_put :: MDB_WriteFlags -> MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO Bool
 mdb_put wf txn dbi key val =
     withKVPtrs key val $ \ pKey pVal ->
@@ -1089,21 +1106,17 @@ reserveData szBytes = MDB_val (fromIntegral szBytes) nullPtr
 
 -- | Delete a given key, or a specific (key,value) pair in case of
 -- MDB_DUPSORT. This function will return False on a MDB_NOTFOUND
--- result.
+-- result, and True on MDB_SUCCESS.
 --
 -- Note: Ideally, LMDB would match the value even without MDB_DUPSORT.
 -- But it doesn't. Under the hood, the data is replaced by a null ptr
 -- if MDB_DUPSORT is not enabled (v0.9.10).
 mdb_del :: MDB_txn -> MDB_dbi -> MDB_val -> Maybe MDB_val -> IO Bool
-mdb_del txn dbi key Nothing =
-    alloca $ \ pKey ->
-    poke pKey key >>
-    _mdb_del (_txn_ptr txn) dbi pKey nullPtr >>= \ rc ->
-    r_del rc
-mdb_del txn dbi key (Just val) =
-    withKVPtrs key val $ \ pKey pVal ->
+mdb_del txn dbi key mbVal =
+    withKVOptPtrs key mbVal $ \ pKey pVal ->
     _mdb_del (_txn_ptr txn) dbi pKey pVal >>= \ rc ->
     r_del rc
+{-# INLINE mdb_del #-}
 
 r_del :: CInt -> IO Bool
 r_del rc =
@@ -1135,15 +1148,11 @@ mdb_reserve' wf txn dbi key szBytes =
 {-# INLINE mdb_reserve' #-}
 
 mdb_del' :: MDB_txn -> MDB_dbi' -> MDB_val -> Maybe MDB_val -> IO Bool
-mdb_del' txn dbi key Nothing =
-    alloca $ \ pKey ->
-    poke pKey key >>
-    _mdb_del' (_txn_ptr txn) dbi pKey nullPtr >>= \ rc ->
-    r_del rc
-mdb_del' txn dbi key (Just val) =
-    withKVPtrs key val $ \ pKey pVal ->
+mdb_del' txn dbi key mbVal =
+    withKVOptPtrs key mbVal $ \ pKey pVal ->
     _mdb_del' (_txn_ptr txn) dbi pKey pVal >>= \rc ->
     r_del rc
+{-# INLINE mdb_del' #-}
 
 -- | compare two values as keys in a database
 mdb_cmp :: MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO Ordering
@@ -1202,8 +1211,10 @@ mdb_cursor_open' txn dbi =
 --
 -- In this case, False is returned for MDB_NOTFOUND (in which case the
 -- cursor should not be moved), and True is returned for MDB_SUCCESS.
+-- Any other return value from LMDB will result in an exception.
+-- 
 -- Depending on the MDB_cursor_op, additional values may be returned
--- via the pointers. 
+-- via the pointers. At the moment
 mdb_cursor_get :: MDB_cursor_op -> MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> IO Bool
 mdb_cursor_get op crs pKey pData = _mdb_cursor_get (_crs_ptr crs) pKey pData (cursorOp op) >>= r_cursor_get
 {-# INLINE mdb_cursor_get #-}
