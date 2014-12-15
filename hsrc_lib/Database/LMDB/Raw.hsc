@@ -32,7 +32,6 @@
 --
 -- * functions directly using file handles 
 -- * user-defined relocation functions 
--- * alloc-avoiding renew and reset operations
 -- * MDB_MULTIPLE is not currently supported (todo)
 -- 
 module Database.LMDB.Raw
@@ -122,6 +121,9 @@ module Database.LMDB.Raw
     -- | Misc
     , mdb_reader_list
     , mdb_reader_check
+
+    , mdb_txn_reset
+    , mdb_txn_renew
 
     -- | Utility
     , withKVPtrs
@@ -217,6 +219,9 @@ foreign import ccall unsafe "lmdb.h mdb_cursor_del" _mdb_cursor_del' :: Ptr MDB_
 foreign import ccall unsafe "lmdb.h mdb_cursor_count" _mdb_cursor_count' :: Ptr MDB_cursor' -> Ptr CSize -> IO CInt
 -- foreign import ccall unsafe "lmdb.h mdb_cursor_txn" _mdb_cursor_txn' :: Ptr MDB_cursor -> IO (Ptr MDB_txn)
 -- foreign import ccall unsafe "lmdb.h mdb_cursor_dbi" _mdb_cursor_dbi' :: Ptr MDB_cursor -> IO MDB_dbi
+
+foreign import ccall unsafe "lmdb.h mdb_txn_reset" _mdb_txn_reset :: Ptr MDB_txn -> IO ()
+foreign import ccall "lmdb.h mdb_txn_renew" _mdb_txn_renew :: Ptr MDB_txn -> IO CInt
 
 foreign import ccall "lmdb.h mdb_reader_list" _mdb_reader_list :: Ptr MDB_env -> FunPtr MDB_msg_func -> Ptr () -> IO CInt
 foreign import ccall "lmdb.h mdb_reader_check" _mdb_reader_check :: Ptr MDB_env -> Ptr CInt -> IO CInt
@@ -915,6 +920,18 @@ mdb_txn_abort :: MDB_txn -> IO ()
 mdb_txn_abort txn = mask_ $ 
     _mdb_txn_abort (_txn_ptr txn) >> 
     _unlockTxn txn
+
+-- | Abort a read-only transaction, but don't destroy it. 
+-- Keep it available for mdb_txn_renew.
+mdb_txn_reset :: MDB_txn -> IO ()
+mdb_txn_reset txn = _mdb_txn_reset (_txn_ptr txn) 
+
+-- | Renew a read-only transaction that was previously _reset.
+mdb_txn_renew :: MDB_txn -> IO ()
+mdb_txn_renew txn =
+    _mdb_txn_renew (_txn_ptr txn) >>= \ rc ->
+    unless (0 == rc) (_throwLMDBErrNum "mdb_txn_renew" rc)
+
 
 {-
 
