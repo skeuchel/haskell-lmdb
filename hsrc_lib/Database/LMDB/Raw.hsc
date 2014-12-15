@@ -151,8 +151,8 @@ import Data.IORef
 -- FFI
 --  'safe': higher overhead, thread juggling, allows callbacks into Haskell
 --  'unsafe': lower overhead, reduced concurrency, no callbacks into Haskell
-foreign import ccall "lmdb.h mdb_version" _mdb_version :: Ptr CInt -> Ptr CInt -> Ptr CInt -> IO CString
-foreign import ccall "lmdb.h mdb_strerror" _mdb_strerror :: CInt -> CString 
+foreign import ccall unsafe "lmdb.h mdb_version" _mdb_version :: Ptr CInt -> Ptr CInt -> Ptr CInt -> IO CString
+foreign import ccall unsafe "lmdb.h mdb_strerror" _mdb_strerror :: CInt -> CString 
 
 foreign import ccall "lmdb.h mdb_env_create" _mdb_env_create :: Ptr (Ptr MDB_env) -> IO CInt
 foreign import ccall "lmdb.h mdb_env_open" _mdb_env_open :: Ptr MDB_env -> CString -> CUInt -> MDB_mode_t -> IO CInt
@@ -168,7 +168,7 @@ foreign import ccall "lmdb.h mdb_env_set_mapsize" _mdb_env_set_mapsize :: Ptr MD
 foreign import ccall "lmdb.h mdb_env_set_maxreaders" _mdb_env_set_maxreaders :: Ptr MDB_env -> CUInt -> IO CInt
 foreign import ccall "lmdb.h mdb_env_get_maxreaders" _mdb_env_get_maxreaders :: Ptr MDB_env -> Ptr CUInt -> IO CInt
 foreign import ccall "lmdb.h mdb_env_set_maxdbs" _mdb_env_set_maxdbs :: Ptr MDB_env -> MDB_dbi_t -> IO CInt
-foreign import ccall "lmdb.h mdb_env_get_maxkeysize" _mdb_env_get_maxkeysize :: Ptr MDB_env -> IO CInt
+foreign import ccall unsafe "lmdb.h mdb_env_get_maxkeysize" _mdb_env_get_maxkeysize :: Ptr MDB_env -> IO CInt
 
 foreign import ccall "lmdb.h mdb_txn_begin" _mdb_txn_begin :: Ptr MDB_env -> Ptr MDB_txn -> CUInt -> Ptr (Ptr MDB_txn) -> IO CInt
 -- foreign import ccall "lmdb.h mdb_txn_env" _mdb_txn_env :: MDB_txn -> IO (Ptr MDB_env)
