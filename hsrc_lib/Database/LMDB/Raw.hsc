@@ -53,7 +53,7 @@ module Database.LMDB.Raw
     , MDB_WriteFlag(..), MDB_WriteFlags, compileWriteFlags
     --, MDB_cursor_op(..)
 
-    -- | Environment Operations
+    -- * Environment Operations
     , mdb_env_create
     , mdb_env_open
     , mdb_env_copy
@@ -70,13 +70,13 @@ module Database.LMDB.Raw
     , mdb_env_set_maxdbs
     , mdb_env_get_maxkeysize
 
-    -- | Transactions
+    -- * Transactions
     , mdb_txn_begin
     , mdb_txn_env
     , mdb_txn_commit
     , mdb_txn_abort
 
-    -- | Databases
+    -- * Databases
     , mdb_dbi_open
     , mdb_stat
     , mdb_dbi_flags
@@ -91,15 +91,15 @@ module Database.LMDB.Raw
     , mdb_dbi_close'
     , mdb_drop', mdb_clear'
 
-    -- | Basic Key-Value Access
+    -- * Basic Key-Value Access
     , mdb_get, mdb_put, mdb_del, mdb_reserve
     , mdb_get', mdb_put', mdb_del', mdb_reserve'
 
-    -- | Database key and value Comparisons
+    -- * Database key and value Comparisons
     , mdb_cmp, mdb_dcmp
     , mdb_cmp', mdb_dcmp'
 
-    -- | Cursors
+    -- * Cursors
     , mdb_cursor_open
     , mdb_cursor_get
     , mdb_cursor_put
@@ -118,14 +118,13 @@ module Database.LMDB.Raw
     , mdb_cursor_dbi'
     , mdb_cursor_count'
 
-    -- | Misc
+    -- * Misc
     , mdb_reader_list
     , mdb_reader_check
 
     , mdb_txn_reset
     , mdb_txn_renew
 
-    -- | Utility
     , withKVPtrs
     , withKVOptPtrs
     ) where
@@ -162,11 +161,11 @@ foreign import ccall "lmdb.h mdb_env_info" _mdb_env_info :: Ptr MDB_env -> Ptr M
 foreign import ccall "lmdb.h mdb_env_sync" _mdb_env_sync :: Ptr MDB_env -> CInt -> IO CInt
 foreign import ccall "lmdb.h mdb_env_close" _mdb_env_close :: Ptr MDB_env -> IO ()
 foreign import ccall "lmdb.h mdb_env_set_flags" _mdb_env_set_flags :: Ptr MDB_env -> CUInt -> CInt -> IO CInt
-foreign import ccall "lmdb.h mdb_env_get_flags" _mdb_env_get_flags :: Ptr MDB_env -> Ptr CUInt -> IO CInt
-foreign import ccall "lmdb.h mdb_env_get_path" _mdb_env_get_path :: Ptr MDB_env -> Ptr CString -> IO CInt
+foreign import ccall unsafe "lmdb.h mdb_env_get_flags" _mdb_env_get_flags :: Ptr MDB_env -> Ptr CUInt -> IO CInt
+foreign import ccall unsafe "lmdb.h mdb_env_get_path" _mdb_env_get_path :: Ptr MDB_env -> Ptr CString -> IO CInt
 foreign import ccall "lmdb.h mdb_env_set_mapsize" _mdb_env_set_mapsize :: Ptr MDB_env -> CSize -> IO CInt
 foreign import ccall "lmdb.h mdb_env_set_maxreaders" _mdb_env_set_maxreaders :: Ptr MDB_env -> CUInt -> IO CInt
-foreign import ccall "lmdb.h mdb_env_get_maxreaders" _mdb_env_get_maxreaders :: Ptr MDB_env -> Ptr CUInt -> IO CInt
+foreign import ccall unsafe "lmdb.h mdb_env_get_maxreaders" _mdb_env_get_maxreaders :: Ptr MDB_env -> Ptr CUInt -> IO CInt
 foreign import ccall "lmdb.h mdb_env_set_maxdbs" _mdb_env_set_maxdbs :: Ptr MDB_env -> MDB_dbi_t -> IO CInt
 foreign import ccall unsafe "lmdb.h mdb_env_get_maxkeysize" _mdb_env_get_maxkeysize :: Ptr MDB_env -> IO CInt
 
@@ -740,9 +739,12 @@ mdb_env_unset_flags env flags =
 
 -- | View the current set of flags for the environment.
 mdb_env_get_flags :: MDB_env -> IO [MDB_EnvFlag]
-mdb_env_get_flags env = alloca $ \ pFlags ->
+mdb_env_get_flags env = decompileEnvFlags <$> _mdb_env_get_flags_u env
+
+_mdb_env_get_flags_u :: MDB_env -> IO CUInt
+_mdb_env_get_flags_u env = alloca $ \ pFlags ->
     _mdb_env_get_flags (_env_ptr env) pFlags >>= \ rc ->
-    if (0 == rc) then decompileEnvFlags <$> peek pFlags else
+    if (0 == rc) then peek pFlags else
     _throwLMDBErrNum "mdb_env_get_flags" rc
 
 -- | Obtain filesystem path for this environment.
@@ -823,17 +825,18 @@ withMsgFunc f = bracket (wrapMsgFunc f) freeHaskellFunPtr
 --
 --     mdb_txn_begin env parent bReadOnly
 --
--- A read-write transaction should be tethered to a specific Haskell thread,
--- which MUST be a 'bound' thread (via forkOS or runInBoundThread). A read
--- only transaction is not so constrained.
+-- NOTE: Unless your MDB_env was created with MDB_NOLOCK, it is necessary
+-- that read-write transactions be created and completed in one Haskell 
+-- 'bound' thread, e.g. via forkOS or runInBoundThread. The bound threads
+-- are necessary because LMDB uses OS-level mutexes which track the thread
+-- ID of their owning thread.
+--
+-- This LMDB adapter includes its own MVar mutex to prevent more than one
+-- Haskell-level thread from trying to write at the same time.
 --
 -- The hierarchical transactions are useful for read-write transactions.
 -- They allow trying something out then aborting if it doesn't work. But
 -- only one child should be active at a time, all in the same OS thread.
---
--- An attempt to grab a writer transaction may block, potentially for a 
--- very long time. It's the responsibility of the software architects to
--- ensure there is no need for long-running write operations.
 --
 mdb_txn_begin :: MDB_env -> Maybe MDB_txn -> Bool -> IO MDB_txn
 mdb_txn_begin env parent bReadOnly = mask_ $ 
@@ -882,11 +885,15 @@ _unlockErr = LMDB_Error
     , e_code = Right MDB_PANIC
     }
 
-_lockEnv env = 
-    isCurrentThreadBound >>= \ bBound ->
-    let bBoundFailure = not bBound && rtsSupportsBoundThreads in
-    if bBoundFailure then throwIO _lockErr else
-    putMVar (_env_wlock env) =<< myThreadId
+_lockEnv env = do
+    safeThread <- isCurrentThreadBound <||> isUnlockedEnv
+    unless safeThread (throwIO _lockErr)
+    tid <- myThreadId
+    putMVar (_env_wlock env) tid
+  where
+    isUnlockedEnv = hasFlag (#const MDB_NOLOCK) <$> _mdb_env_get_flags_u env
+    hasFlag f fs = (f == (f .&. fs))
+    getA <||> getB = getA >>= \ a -> if a then return True else getB
 
 _unlockEnv env = 
     myThreadId >>= \ self ->
