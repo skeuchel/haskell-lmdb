@@ -1,11 +1,11 @@
 Name: lmdb
-Version: 0.2.4
+Version: 0.2.5
 Synopsis: Lightning MDB bindings 
 Category: Database
 Description:
   LMDB is a read-optimized Berkeley DB replacement developed by Symas
   for the OpenLDAP project. LMDB has impressive performance characteristics 
-  and a friendly BSD-style Open LDAP license. See <http://symas.com/mdb/>.
+  and a friendly BSD-style OpenLDAP license. See <http://symas.com/mdb/>.
   .
   This library has Haskell bindings to the LMDB library. You must install 
   the lmdb development files before installing this library, 
