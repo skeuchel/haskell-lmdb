@@ -43,7 +43,7 @@ module Database.LMDB.Raw
     , MDB_txn, MDB_txnid
     , MDB_cursor, MDB_cursor'
 
-    , MDB_val, mv_size, mv_data
+    , MDB_val(..)
     , MDB_stat, ms_psize, ms_depth, ms_branch_pages, ms_leaf_pages, ms_overflow_pages, ms_entries
     , MDB_envinfo, me_mapaddr, me_mapsize, me_last_pgno, me_last_txnid, me_maxreaders, me_numreaders
     , MDB_cmp_func, wrapCmpFn
@@ -1184,6 +1184,7 @@ mdb_cmp txn dbi a b =
     withKVPtrs a b $ \ pA pB ->
     _mdb_cmp (_txn_ptr txn) dbi pA pB >>= \ rc ->
     return (compare rc 0)
+{-# INLINE mdb_cmp #-}
 
 -- | compare two values as data in an MDB_DUPSORT database
 mdb_dcmp :: MDB_txn -> MDB_dbi -> MDB_val -> MDB_val -> IO Ordering
@@ -1191,18 +1192,21 @@ mdb_dcmp txn dbi a b =
     withKVPtrs a b $ \ pA pB ->
     _mdb_dcmp (_txn_ptr txn) dbi pA pB >>= \ rc ->
     return (compare rc 0)
+{-# INLINE mdb_dcmp #-}
 
 mdb_cmp' :: MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO Ordering
 mdb_cmp' txn dbi a b =
     withKVPtrs a b $ \ pA pB ->
     _mdb_cmp' (_txn_ptr txn) dbi pA pB >>= \ rc ->
     return (compare rc 0)
+{-# INLINE mdb_cmp' #-}
 
 mdb_dcmp' :: MDB_txn -> MDB_dbi' -> MDB_val -> MDB_val -> IO Ordering
 mdb_dcmp' txn dbi a b =
     withKVPtrs a b $ \ pA pB ->
     _mdb_dcmp' (_txn_ptr txn) dbi pA pB >>= \ rc ->
     return (compare rc 0)
+{-# INLINE mdb_dcmp' #-}
 
 -- | open a cursor for the database.
 mdb_cursor_open :: MDB_txn -> MDB_dbi -> IO MDB_cursor
@@ -1321,6 +1325,7 @@ mdb_cursor_count crs =
     _mdb_cursor_count (_crs_ptr crs) pCount >>= \ rc ->
     if (0 == rc) then fromIntegral <$> _peekSize pCount else
     _throwLMDBErrNum "mdb_cursor_count" rc
+{-# INLINE mdb_cursor_count #-}
 
 _peekSize :: Ptr CSize -> IO CSize
 _peekSize = peek
@@ -1331,6 +1336,7 @@ mdb_cursor_count' crs =
     _mdb_cursor_count' (_crs_ptr' crs) pCount >>= \ rc ->
     if (0 == rc) then fromIntegral <$> _peekSize pCount else
     _throwLMDBErrNum "mdb_cursor_count" rc
+{-# INLINE mdb_cursor_count' #-}
 
 
 -- for cursor get...
