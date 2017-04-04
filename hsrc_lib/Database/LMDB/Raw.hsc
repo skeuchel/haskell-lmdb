@@ -145,7 +145,9 @@ import Data.Function (on)
 import Data.Maybe (isNothing)
 import Data.IORef
 
+#if __GLASGOW_HASKELL__ < 800
 #let alignment t = "%lu", (unsigned long)offsetof(struct {char x__; t (y__); }, y__)
+#endif
 
 -- FFI
 --  'safe': higher overhead, thread juggling, allows callbacks into Haskell
